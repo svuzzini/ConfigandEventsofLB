@@ -1,0 +1,22 @@
+{
+  "name": "avi-config-analyzer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ingest an Avi (NSX ALB) controller config export and explore it as a queryable object graph.",
+  "workspaces": [
+    "packages/shared",
+    "packages/server",
+    "packages/web"
+  ],
+  "scripts": {
+    "build": "npm run build -w @avi/shared && npm run build -w @avi/server && npm run build -w @avi/web",
+    "build:shared": "npm run build -w @avi/shared",
+    "dev:server": "npm run dev -w @avi/server",
+    "dev:web": "npm run dev -w @avi/web",
+    "test": "npm run test -w @avi/server",
+    "typecheck": "tsc -b --pretty"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

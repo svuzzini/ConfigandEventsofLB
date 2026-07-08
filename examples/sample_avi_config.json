@@ -1,0 +1,125 @@
+{
+  "META": {
+    "version": { "Version": "22.1.3", "build": 9099, "Date": "2024-02-11 10:04:22" },
+    "cluster_uuid": "cluster-6f2a1c8e-3d4b-4a90-9f21-2b7c9de10a11"
+  },
+  "Tenant": [
+    { "name": "admin", "uuid": "tenant-admin-0001" },
+    { "name": "prod", "uuid": "tenant-prod-0002" }
+  ],
+  "Cloud": [
+    { "name": "Default-Cloud", "uuid": "cloud-default-0001", "vtype": "CLOUD_VCENTER", "tenant_ref": "https://ctrl/api/tenant/tenant-admin-0001#admin" },
+    { "name": "aws-cloud", "uuid": "cloud-aws-0002", "vtype": "CLOUD_AWS", "tenant_ref": "https://ctrl/api/tenant/tenant-admin-0001#admin" }
+  ],
+  "VrfContext": [
+    { "name": "global", "uuid": "vrfcontext-global-0001", "cloud_ref": "https://ctrl/api/cloud/cloud-default-0001#Default-Cloud", "tenant_ref": "https://ctrl/api/tenant/tenant-admin-0001#admin" }
+  ],
+  "ServiceEngineGroup": [
+    { "name": "Default-Group", "uuid": "serviceenginegroup-def-0001", "max_vs_per_se": 10, "cloud_ref": "https://ctrl/api/cloud/cloud-default-0001#Default-Cloud", "tenant_ref": "https://ctrl/api/tenant/tenant-admin-0001#admin" }
+  ],
+  "HealthMonitor": [
+    { "name": "System-HTTP", "uuid": "healthmonitor-http-0001", "type": "HEALTH_MONITOR_HTTP", "tenant_ref": "https://ctrl/api/tenant/tenant-admin-0001#admin" },
+    { "name": "System-TCP", "uuid": "healthmonitor-tcp-0002", "type": "HEALTH_MONITOR_TCP", "tenant_ref": "https://ctrl/api/tenant/tenant-admin-0001#admin" },
+    { "name": "unused-ping", "uuid": "healthmonitor-ping-0003", "type": "HEALTH_MONITOR_PING", "tenant_ref": "https://ctrl/api/tenant/tenant-prod-0002#prod" }
+  ],
+  "ApplicationProfile": [
+    { "name": "System-Secure-HTTP", "uuid": "applicationprofile-http-0001", "type": "APPLICATION_PROFILE_TYPE_HTTP", "tenant_ref": "https://ctrl/api/tenant/tenant-admin-0001#admin" }
+  ],
+  "NetworkProfile": [
+    { "name": "System-TCP-Proxy", "uuid": "networkprofile-tcp-0001", "profile": { "type": "PROTOCOL_TYPE_TCP_PROXY" }, "tenant_ref": "https://ctrl/api/tenant/tenant-admin-0001#admin" }
+  ],
+  "SSLKeyAndCertificate": [
+    {
+      "name": "prod-wildcard", "uuid": "sslkeyandcertificate-prod-0001",
+      "tenant_ref": "https://ctrl/api/tenant/tenant-prod-0002#prod",
+      "certificate": { "subject": { "common_name": "*.prod.example.com" }, "not_after": "2035-01-01 00:00:00", "not_before": "2023-01-01 00:00:00" }
+    },
+    {
+      "name": "legacy-expired", "uuid": "sslkeyandcertificate-legacy-0002",
+      "tenant_ref": "https://ctrl/api/tenant/tenant-prod-0002#prod",
+      "certificate": { "subject": { "common_name": "old.example.com" }, "not_after": "2021-06-01 00:00:00" }
+    },
+    {
+      "name": "expiring-soon", "uuid": "sslkeyandcertificate-soon-0003",
+      "tenant_ref": "https://ctrl/api/tenant/tenant-prod-0002#prod",
+      "certificate": { "subject": { "common_name": "soon.example.com" }, "not_after": "2026-07-23 00:00:00" }
+    },
+    {
+      "name": "System-Default-Cert", "uuid": "sslkeyandcertificate-sysdef-0004",
+      "tenant_ref": "https://ctrl/api/tenant/tenant-admin-0001#admin",
+      "certificate": { "subject": { "common_name": "System-Default-Cert" }, "not_after": "2035-01-01 00:00:00" }
+    }
+  ],
+  "Pool": [
+    {
+      "name": "web-pool", "uuid": "pool-web-0001", "enabled": true,
+      "tenant_ref": "https://ctrl/api/tenant/tenant-prod-0002#prod",
+      "cloud_ref": "https://ctrl/api/cloud/cloud-default-0001#Default-Cloud",
+      "health_monitor_refs": ["https://ctrl/api/healthmonitor/healthmonitor-http-0001#System-HTTP"],
+      "servers": [{ "ip": { "addr": "10.0.1.11", "type": "V4" } }, { "ip": { "addr": "10.0.1.12", "type": "V4" } }]
+    },
+    {
+      "name": "api-pool", "uuid": "pool-api-0002", "enabled": true,
+      "tenant_ref": "https://ctrl/api/tenant/tenant-prod-0002#prod",
+      "cloud_ref": "https://ctrl/api/cloud/cloud-default-0001#Default-Cloud",
+      "health_monitor_refs": ["https://ctrl/api/healthmonitor/healthmonitor-tcp-0002#System-TCP"]
+    },
+    {
+      "name": "orphan-pool", "uuid": "pool-orphan-0003", "enabled": false,
+      "tenant_ref": "https://ctrl/api/tenant/tenant-prod-0002#prod",
+      "cloud_ref": "https://ctrl/api/cloud/cloud-default-0001#Default-Cloud",
+      "health_monitor_refs": ["https://ctrl/api/healthmonitor/healthmonitor-GONE-9999#missing-hm"]
+    }
+  ],
+  "PoolGroup": [
+    {
+      "name": "web-pg", "uuid": "poolgroup-web-0001",
+      "tenant_ref": "https://ctrl/api/tenant/tenant-prod-0002#prod",
+      "members": [
+        { "pool_ref": "https://ctrl/api/pool/pool-web-0001#web-pool", "ratio": 100 },
+        { "pool_ref": "https://ctrl/api/pool/pool-api-0002#api-pool", "ratio": 50 }
+      ]
+    }
+  ],
+  "VsVip": [
+    {
+      "name": "web-vip", "uuid": "vsvip-web-0001",
+      "tenant_ref": "https://ctrl/api/tenant/tenant-prod-0002#prod",
+      "cloud_ref": "https://ctrl/api/cloud/cloud-default-0001#Default-Cloud",
+      "vip": [{ "vip_id": "1", "ip_address": { "addr": "203.0.113.10", "type": "V4" } }]
+    }
+  ],
+  "VirtualService": [
+    {
+      "name": "web-vs", "uuid": "virtualservice-web-0001", "enabled": true,
+      "tenant_ref": "https://ctrl/api/tenant/tenant-prod-0002#prod",
+      "cloud_ref": "https://ctrl/api/cloud/cloud-default-0001#Default-Cloud",
+      "vsvip_ref": "https://ctrl/api/vsvip/vsvip-web-0001#web-vip",
+      "pool_group_ref": "https://ctrl/api/poolgroup/poolgroup-web-0001#web-pg",
+      "se_group_ref": "https://ctrl/api/serviceenginegroup/serviceenginegroup-def-0001#Default-Group",
+      "application_profile_ref": "https://ctrl/api/applicationprofile/applicationprofile-http-0001#System-Secure-HTTP",
+      "network_profile_ref": "https://ctrl/api/networkprofile/networkprofile-tcp-0001#System-TCP-Proxy",
+      "ssl_key_and_certificate_refs": ["https://ctrl/api/sslkeyandcertificate/sslkeyandcertificate-prod-0001#prod-wildcard"],
+      "services": [{ "port": 443, "enable_ssl": true }]
+    },
+    {
+      "name": "api-vs", "uuid": "virtualservice-api-0002", "enabled": true,
+      "tenant_ref": "https://ctrl/api/tenant/tenant-prod-0002#prod",
+      "cloud_ref": "https://ctrl/api/cloud/cloud-default-0001#Default-Cloud",
+      "vsvip_ref": "https://ctrl/api/vsvip/vsvip-web-0001#web-vip",
+      "pool_ref": "https://ctrl/api/pool/pool-api-0002#api-pool",
+      "se_group_ref": "https://ctrl/api/serviceenginegroup/serviceenginegroup-def-0001#Default-Group",
+      "application_profile_ref": "https://ctrl/api/applicationprofile/applicationprofile-http-0001#System-Secure-HTTP",
+      "ssl_key_and_certificate_refs": ["https://ctrl/api/sslkeyandcertificate/sslkeyandcertificate-sysdef-0004#System-Default-Cert"],
+      "services": [{ "port": 443, "enable_ssl": true }]
+    },
+    {
+      "name": "legacy-vs", "uuid": "virtualservice-legacy-0003", "enabled": false,
+      "tenant_ref": "https://ctrl/api/tenant/tenant-prod-0002#prod",
+      "cloud_ref": "https://ctrl/api/cloud/cloud-default-0001#Default-Cloud",
+      "vsvip_ref": "https://ctrl/api/vsvip/vsvip-web-0001#web-vip",
+      "pool_ref": "https://ctrl/api/pool/pool-web-0001#web-pool",
+      "se_group_ref": "https://ctrl/api/serviceenginegroup/serviceenginegroup-def-0001#Default-Group"
+    }
+  ]
+}
