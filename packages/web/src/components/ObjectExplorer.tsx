@@ -1,14 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Inventory, ObjectDetail, ObjectListPage, SortDir } from '@avi/shared';
 import { api } from '../api/client.js';
 import { JsonView } from './JsonView.js';
 
 const PAGE = 50;
+const SEARCH_DEBOUNCE_MS = 200;
 
 export function ObjectExplorer({ datasetId }: { datasetId: string }) {
   const [inv, setInv] = useState<Inventory | null>(null);
   const [type, setType] = useState<string | null>(null);
   const [search, setSearch] = useState('');
+  // Only typing is debounced; paging / sorting / type switches load immediately.
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [sort, setSort] = useState('name');
   const [dir, setDir] = useState<SortDir>('asc');
   const [offset, setOffset] = useState(0);
@@ -16,27 +19,41 @@ export function ObjectExplorer({ datasetId }: { datasetId: string }) {
   const [openUuid, setOpenUuid] = useState<string | null>(null);
   const [detail, setDetail] = useState<ObjectDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Monotonic sequence so a slow, older response can never clobber a newer one.
+  const seqRef = useRef(0);
 
   useEffect(() => {
+    let alive = true;
     api.inventory(datasetId).then((i) => {
+      if (!alive) return;
       setInv(i);
       setType((t) => t ?? i.byType[0]?.key ?? null);
-    }).catch((e: unknown) => setError(String(e)));
+    }).catch((e: unknown) => alive && setError(String(e)));
+    return () => {
+      alive = false;
+    };
   }, [datasetId]);
+
+  useEffect(() => {
+    const id = setTimeout(() => setDebouncedSearch(search), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(id);
+  }, [search]);
 
   const load = useCallback(() => {
     if (!type) return;
+    const seq = ++seqRef.current;
     setError(null);
     api
-      .objects(datasetId, type, { search, sort, dir, offset, limit: PAGE })
-      .then(setPage)
-      .catch((e: unknown) => setError(String(e)));
-  }, [datasetId, type, search, sort, dir, offset]);
+      .objects(datasetId, type, { search: debouncedSearch, sort, dir, offset, limit: PAGE })
+      .then((p) => {
+        if (seq === seqRef.current) setPage(p);
+      })
+      .catch((e: unknown) => {
+        if (seq === seqRef.current) setError(String(e));
+      });
+  }, [datasetId, type, debouncedSearch, sort, dir, offset]);
 
-  useEffect(() => {
-    const id = setTimeout(load, 150); // debounce search
-    return () => clearTimeout(id);
-  }, [load]);
+  useEffect(load, [load]);
 
   const onSort = (col: string) => {
     if (sort === col) setDir((d) => (d === 'asc' ? 'desc' : 'asc'));
@@ -55,7 +72,10 @@ export function ObjectExplorer({ datasetId }: { datasetId: string }) {
     }
     setOpenUuid(uuid);
     setDetail(null);
-    api.object(datasetId, uuid).then(setDetail).catch((e: unknown) => setError(String(e)));
+    api
+      .object(datasetId, uuid)
+      .then((d) => setDetail((cur) => (uuid === d.node.uuid ? d : cur)))
+      .catch((e: unknown) => setError(String(e)));
   };
 
   const columns = page?.columns ?? [];
@@ -133,6 +153,13 @@ export function ObjectExplorer({ datasetId }: { datasetId: string }) {
                   }
                 />
               ))}
+              {page && page.rows.length === 0 && (
+                <tr>
+                  <td colSpan={4 + columns.length} className="muted" style={{ padding: 24 }}>
+                    No objects match{debouncedSearch ? ` “${debouncedSearch}”` : ''}.
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>

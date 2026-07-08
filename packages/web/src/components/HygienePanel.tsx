@@ -10,9 +10,16 @@ export function HygienePanel({ datasetId }: { datasetId: string }) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let alive = true;
     setError(null);
     setReport(null);
-    api.hygiene(datasetId).then(setReport).catch((e: unknown) => setError(String(e)));
+    api
+      .hygiene(datasetId)
+      .then((r) => alive && setReport(r))
+      .catch((e: unknown) => alive && setError(String(e)));
+    return () => {
+      alive = false;
+    };
   }, [datasetId]);
 
   if (error) return <div className="error">{error}</div>;

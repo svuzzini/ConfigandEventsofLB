@@ -17,6 +17,7 @@ import type {
 } from '@avi/shared';
 import type { Registry } from '../registry.js';
 import { ingestFile } from '../ingest/load.js';
+import { runHygiene } from '../hygiene/rules.js';
 import { newDatasetId } from '../util/ids.js';
 import { cellValue } from '../util/columns.js';
 import { log } from '../util/logger.js';
@@ -147,13 +148,15 @@ export function makeRouter(registry: Registry, dataDir: string): Router {
     return res.json(dep);
   });
 
-  // --- Hygiene report. ---
+  // --- Hygiene report (cached: datasets are immutable once ingested). ---
   router.get('/datasets/:id/hygiene', async (req, res) => {
     const id = req.params.id!;
+    const cached = registry.getHygiene(id);
+    if (cached) return res.json(cached);
     const graph = await registry.getGraph(id);
     if (!graph) return notFound(res, 'dataset');
-    const { runHygiene } = await import('../hygiene/rules.js');
     const report = await runHygiene(registry.store, graph, id);
+    registry.putHygiene(id, report);
     return res.json(report);
   });
 

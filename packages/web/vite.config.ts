@@ -12,5 +12,12 @@ export default defineConfig({
       '/health': { target: API_TARGET, changeOrigin: true },
     },
   },
+  preview: {
+    port: 5174,
+    proxy: {
+      '/api': { target: API_TARGET, changeOrigin: true },
+      '/health': { target: API_TARGET, changeOrigin: true },
+    },
+  },
   build: { outDir: 'dist', sourcemap: true },
 });

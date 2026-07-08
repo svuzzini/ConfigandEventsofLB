@@ -41,6 +41,9 @@ export class SqliteStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS idx_obj_ds_type ON objects(dataset_id, type);
       CREATE INDEX IF NOT EXISTS idx_obj_ds_uuid ON objects(dataset_id, uuid);
+      -- Covers the default explorer query: filter by (dataset, type), order by
+      -- name, LIMIT/OFFSET — turns a scan+sort into a straight index walk.
+      CREATE INDEX IF NOT EXISTS idx_obj_ds_type_name ON objects(dataset_id, type, name);
     `);
   }
 

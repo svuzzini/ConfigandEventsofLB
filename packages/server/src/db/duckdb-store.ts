@@ -55,6 +55,7 @@ export class DuckdbStore implements Store {
       );
       CREATE INDEX IF NOT EXISTS idx_obj_ds_type ON objects(dataset_id, type);
       CREATE INDEX IF NOT EXISTS idx_obj_ds_uuid ON objects(dataset_id, uuid);
+      CREATE INDEX IF NOT EXISTS idx_obj_ds_type_name ON objects(dataset_id, type, name);
     `);
   }
 
