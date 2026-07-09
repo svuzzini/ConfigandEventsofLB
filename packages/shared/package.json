@@ -13,5 +13,8 @@
   "scripts": {
     "build": "tsc -b",
     "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
   }
 }

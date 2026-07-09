@@ -17,6 +17,9 @@
     "typecheck": "tsc -b --pretty"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
   }
 }
