@@ -165,3 +165,22 @@ packages/
   web/      React + ECharts dashboard
 examples/   sample_avi_config.json (sanitized)
 ```
+
+## Deploying on a server (single process)
+
+`npm run build` produces everything; the API server then also serves the web UI
+(`packages/web/dist`, auto-detected — override with `WEB_DIST`), so one Node process
+on one port is a complete deployment:
+
+```bash
+npm ci && npm run build
+PORT=4000 DATA_DIR=/var/lib/avi-analyzer node packages/server/dist/index.js
+# → http://<server>:4000
+```
+
+Env: `PORT` (4000), `HOST` (0.0.0.0), `DATA_DIR` (./data), `DB_PATH`, `STORE`
+(`sqlite`|`duckdb`), `WEB_DIST`.
+
+For a real installation put it behind systemd + a reverse proxy (nginx/caddy) for
+TLS; the app itself has **no authentication**, so don't expose config dumps to the
+open internet without one.
