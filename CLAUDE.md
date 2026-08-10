@@ -4,50 +4,70 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Avi Config Analyzer — ingests a VMware Avi (NSX ALB) controller configuration export (a single large JSON file keyed by object type) and serves it as a queryable object graph with a React dashboard (inventory, object explorer, per-VirtualService dependency graph, hygiene findings). npm-workspaces monorepo: `@avi/shared` (types + ref parsing), `@avi/server` (Node/Express API), `@avi/web` (React + Vite + ECharts).
+Avi Config Analyzer — a **single self-contained HTML file** (`avi-analyzer.html`)
+that parses a VMware Avi (NSX ALB) controller configuration export (one large
+JSON object keyed by object type) entirely in the browser and presents it as an
+object graph: inventory, object explorer, per-object dependency graph, hygiene
+findings. Zero install: open the file via `file://`, drop the export on it. No
+build step, no dependencies, no network — a strict CSP (`default-src 'none'`)
+makes requests impossible; keep it that way.
 
-Requires Node ≥ 22 in practice (the default store uses `node:sqlite`).
+`legacy/avi_config_inspector.html` and `docs/CODE_REVIEW.md` are historical.
+The previous client-server monorepo (`packages/`) was removed in favor of this
+file; it lives in git history if a server-backed design is ever needed again
+(inputs > ~500 MB).
 
 ## Commands
 
 ```bash
-npm install                    # all workspaces
-npm run build:shared           # REQUIRED once before server/web typecheck — both import @avi/shared from dist/
-
-npm run dev:server             # API on :4000 (env: PORT, DATA_DIR=./data, STORE=sqlite|duckdb)
-npm run dev:web                # Vite on :5173, proxies /api → :4000 (override with API_TARGET)
-
-npx tsc -b tsconfig.json       # typecheck shared + server (project references)
-npm run typecheck -w @avi/web  # typecheck web (separate — not in the tsc -b graph)
-
-# Tests (node:test; compiled first — the ts-node loader path is flaky on Node 22)
-npm run build -w @avi/shared && npm run build -w @avi/server
-node --test packages/server/dist/**/*.test.js
-# Single test file:
-node --test packages/server/dist/graph/ref-graph.test.js
-
-# CLI ingest without HTTP:
-node packages/server/dist/cli/ingest.js examples/sample_avi_config.json data/avi.sqlite
-
-# Smoke-test ingest over HTTP (body = raw JSON, streamed):
-curl -X POST "http://localhost:4000/api/datasets?name=sample.json" \
-  --data-binary @examples/sample_avi_config.json -H "content-type: application/octet-stream"
+npm test                                  # node --test tools/tests/*.test.mjs (Node >= 20, no installs)
+node --test tools/tests/scanner.test.mjs  # single suite
 ```
 
-## Architecture
+There is no build. The HTML file is the source of truth; `tools/extract-app.mjs`
+pulls the inline `<script type="module" id="app">` out of it and imports it via
+a data: URL so tests run against the exact shipped code. The module's UI half is
+gated behind `typeof document !== 'undefined'`, which is what makes it loadable
+in Node — keep new UI code inside `boot()`.
 
-One-pass pipeline, server-side: **streaming parse → (store + graph) → REST → thin UI**. The browser never receives the raw dump; every API response is paginated or aggregated.
+## Architecture (all inside avi-analyzer.html, in order)
 
-- **Ingest** (`server/src/ingest/stream-parse.ts` + `load.ts`): `stream-json` tokens drive a depth-aware state machine that assembles one array element at a time — peak heap is O(largest object), never O(file). Each object goes to the store (batched inserts) and the graph in the same pass. Do not replace this with `JSON.parse` or stream-json's `StreamObject` (which assembles whole top-level arrays).
-- **RefGraph** (`server/src/graph/ref-graph.ts`): in-memory index of *lightweight* nodes (uuid/type/name/tenant/cloud) + resolved edges. Two-phase: `addObject()` collects edge specs, then a single `resolve()` matches refs by uuid variant first, then by (type, name). Full payloads live only in the store. Rebuilt lazily from the store on restart via `Registry.getGraph()`.
-- **Store** (`server/src/db/store.ts` interface): `node:sqlite` default, `duckdb-async` behind `STORE=duckdb` (optional dep, falls back to SQLite if not installed). Both implement identical SQL semantics; keep them in lockstep when changing schema (e.g. indexes exist in both files).
-- **API** (`server/src/api/routes.ts`): endpoint table and all request/response DTOs are in `packages/shared/src/api-contract.ts` — change the contract there first; both server and web compile against it. Hygiene reports are cached per dataset in `Registry` (datasets are immutable after ingest); anything that mutates a dataset must call `registry.invalidate()`.
-- **Web** (`packages/web`): four tabs, each `React.lazy` so ECharts stays out of the initial chunk. ECharts is the modular build — new chart/component types must be registered in `web/src/components/charts/echarts.tsx` (`echarts.use([...])`) or they silently render nothing. Data fetches use monotonic-sequence guards to drop stale responses; keep that pattern for new views.
+- **refs** — the single home for `*_ref` string parsing (uuid variants,
+  `#fragment` / `?name=` forms). Never re-implement ref parsing elsewhere.
+- **ConfigScanner / scanBlob** — streaming depth-counting slicer. Finds each
+  array element's exact character range and hands the slice to native
+  `JSON.parse`; transient memory is O(largest object), never O(file). Do NOT
+  replace this with a whole-file `JSON.parse` (multi-GB heap on big exports) or
+  a token-at-a-time JS tokenizer (measured 8× slower than native parse).
+  `scanBlob` reads `blob.stream()` chunk by chunk — each await is the yield
+  point that keeps the progress bar painting; don't make it synchronous.
+- **RefGraph** — lightweight nodes (uuid/type/name/tenant/cloud) + edges.
+  Two-phase: `addObject()` stashes edge specs, one `resolve()` matches by uuid
+  variant first, then (type, name). Guarded by `hasIdentity` — objects need a
+  name or uuid to be indexed.
+- **Dataset** — the in-memory store: one raw JSON slice per object
+  (serialization for free), parsed on demand; caches inventory, per-type
+  columns, per-column sort values (built chunked+yielding), and the hygiene
+  report.
+- **hygiene** — pure rules over (dataset, graph). Counts are always exact; at
+  most `MAX_EXEMPLARS` (500) findings kept per rule — never render or retain
+  unbounded findings. New rules follow the `add(ruleId, severity, ...)` pattern.
+- **ui** — vanilla DOM in `boot()`. Four views; every list is paginated; only
+  the visible page's objects are ever parsed for display. Charts are plain SVG
+  (bars, slice-and-dice treemap, layered BFS dependency graph — deterministic,
+  no physics). Keep light/dark via `prefers-color-scheme` and WCAG AA contrast.
 
 ## Invariants
 
-- **Ref parsing has one home**: `packages/shared/src/refs.ts`. Both ingest and API import it; never re-implement `*_ref` string handling elsewhere. Refs match by trailing-path uuid (both `pool-<uuid>` and bare `<uuid>` variants), falling back to `#fragment`/`?name=` name.
-- **Version tolerance**: Avi schema drifts across 18.x–22.x. Never model Avi objects as closed interfaces — everything is the open `AviObject` bag in `shared/src/avi-types.ts`, read through its `getString`/`getBool`/`getArray` accessors. Unknown fields must flow through untouched. Mark schema guesses with `// ASSUMPTION` comments (existing convention).
-- **No `any`** anywhere; parse paths degrade (skip/null) rather than throw.
-- ESM throughout: relative imports need explicit `.js` extensions, including in `.ts` sources.
-- Hygiene rules (`server/src/hygiene/rules.ts`) are pure functions over (store, graph); new rules need a `HygieneRuleId` added to the union in `api-contract.ts`.
+- **Version tolerance**: Avi schema drifts across 18.x–22.x. Objects are open
+  bags read via `getString`/`getBool` accessors; unknown fields flow through
+  untouched (raw slices guarantee this). Mark schema guesses with
+  `// ASSUMPTION` comments (existing convention).
+- Parse paths degrade (skip / return null) rather than throw; scanner errors
+  carry a character `offset` and are surfaced to the user in plain language.
+- Everything is bounded: pagination for tables, `MAX_GRAPH_NODES`/`MAX_GRAPH_DEPTH`
+  for graphs, `MAX_EXEMPLARS` for hygiene, a 2 MB cap on JSON syntax
+  highlighting. Any new view must have an explicit answer for "what happens at
+  100k items".
+- Tests in `tools/tests/` must keep passing against the extracted module — if
+  you rename an export in the HTML, update the tests.

@@ -1,0 +1,1769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  Avi (NSX ALB) Config Analyzer — single-file, zero-install, 100% client-side.
+
+  Open this file directly (file://) in any modern browser. Drop a controller
+  configuration export (the big JSON keyed by object type) onto the page.
+  Nothing is uploaded anywhere: the Content-Security-Policy below makes network
+  requests impossible, not merely absent.
+
+  Architecture (all inline, in the <script type="module"> at the bottom):
+    scanner  — streaming depth-counting slicer over File chunks; peak transient
+               memory is O(largest single object), never O(file)
+    refs     — single home for *_ref string parsing (uuid variants, #fragment,
+               ?name= forms)
+    graph    — lightweight node + resolved edge index (uuid-first, name fallback)
+    dataset  — in-memory store: raw text slice per object, parsed on demand
+    hygiene  — pure rules over (dataset, graph); exact counts, capped exemplars
+    ui       — vanilla DOM; four views: Inventory / Explorer / Relationships /
+               Hygiene. No framework, no build step, no dependencies.
+
+  Tests: tools/run under `node --test tools/tests/` — the harness extracts this
+  file's module (marked id="app") and imports it; keep the exports stable.
+-->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<title>Avi Config Analyzer</title>
+<style>
+  :root {
+    --ui: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+
+    --bg: #eef1f6; --panel: #ffffff; --panel-2: #f6f8fb;
+    --ink: #16202e; --muted: #55616e; --faint: #8a94a1;
+    --line: #dbe2ea; --line-2: #eaeef4;
+    --accent: #4f46e5; --accent-ink: #4338ca; --accent-bg: #eef2ff;
+    --ok: #15803d; --warn: #b45309; --err: #b91c1c;
+    --ok-bg: #dcfce7; --warn-bg: #fef3c7; --err-bg: #fee2e2; --info-bg: #e0f2fe; --info: #075985;
+    --sel: #eef2ff;
+    --tok-key: #4338ca; --tok-str: #15803d; --tok-num: #b45309; --tok-bool: #7c3aed; --tok-null: #8a94a1;
+    --r: 8px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1320; --panel: #151c2c; --panel-2: #1a2234;
+      --ink: #e6ebf3; --muted: #a3aebc; --faint: #6d7889;
+      --line: #2a3346; --line-2: #222b3d;
+      --accent: #8b93f8; --accent-ink: #a5acff; --accent-bg: #232b4a;
+      --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+      --ok-bg: #14321f; --warn-bg: #372a10; --err-bg: #3b1a1a; --info-bg: #12293b; --info: #7dd3fc;
+      --sel: #232b4a;
+      --tok-key: #a5acff; --tok-str: #4ade80; --tok-num: #fbbf24; --tok-bool: #c4b5fd; --tok-null: #6d7889;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font: 13px/1.45 var(--ui); color: var(--ink); background: var(--bg);
+    min-height: 100vh; display: flex; flex-direction: column;
+  }
+  code, .mono, pre { font-family: var(--mono); font-size: 12px; }
+  button { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  header.top {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  header.top h1 { font-size: 15px; margin: 0; }
+  header.top .pipeline { color: var(--muted); font-size: 12px; }
+  header.top .pipeline b { color: var(--ink); font-weight: 600; }
+  header.top .spacer { flex: 1; }
+
+  .tabs { display: flex; gap: 2px; }
+  .tab {
+    border: 1px solid transparent; background: none; padding: 5px 12px; cursor: pointer;
+    border-radius: var(--r); color: var(--muted);
+  }
+  .tab:hover { background: var(--panel-2); color: var(--ink); }
+  .tab[aria-selected="true"] { background: var(--accent-bg); color: var(--accent-ink); font-weight: 600; }
+
+  .btn {
+    border: 1px solid var(--line); background: var(--panel); border-radius: var(--r);
+    padding: 5px 12px; cursor: pointer;
+  }
+  .btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-ink); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+
+  main { flex: 1; padding: 14px 16px; max-width: 1500px; width: 100%; margin: 0 auto; }
+  footer.privacy {
+    padding: 8px 16px; text-align: center; color: var(--muted); font-size: 12px;
+    border-top: 1px solid var(--line);
+  }
+  footer.privacy .lock { color: var(--ok); font-weight: 600; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 12px; }
+  .muted { color: var(--muted); }
+  .faint { color: var(--faint); }
+  .k { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+
+  /* ---- upload / progress ---- */
+  .center-col { max-width: 640px; margin: 8vh auto 0; display: flex; flex-direction: column; gap: 14px; }
+  .dropzone {
+    border: 2px dashed var(--line); border-radius: var(--r); padding: 48px 24px; text-align: center;
+    cursor: pointer; background: var(--panel); width: 100%;
+  }
+  .dropzone.drag, .dropzone:hover { border-color: var(--accent); background: var(--accent-bg); }
+  .dropzone .big { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+  .privacy-note {
+    display: flex; gap: 8px; align-items: baseline; justify-content: center;
+    color: var(--muted); font-size: 12px;
+  }
+  .progress-wrap { display: flex; flex-direction: column; gap: 8px; }
+  .progress-bar { height: 8px; background: var(--line-2); border-radius: 4px; overflow: hidden; }
+  .progress-bar > div { height: 100%; background: var(--accent); width: 0%; }
+  .error-box {
+    background: var(--err-bg); color: var(--err); border: 1px solid var(--err);
+    border-radius: var(--r); padding: 10px 12px;
+  }
+  .error-box details { color: var(--ink); margin-top: 6px; }
+  .error-box summary { cursor: pointer; }
+
+  /* ---- stats ---- */
+  .stat-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 8px 14px; min-width: 90px; }
+  .stat .v { font-size: 18px; font-weight: 650; margin-top: 2px; }
+  .stat .v small { font-size: 11px; font-weight: 400; color: var(--muted); }
+  .stat.clickable { cursor: pointer; }
+  .stat.clickable:hover { border-color: var(--accent); }
+  .stat.active { outline: 2px solid var(--accent); }
+
+  /* ---- charts ---- */
+  .charts { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px; }
+  @media (max-width: 1000px) { .charts { grid-template-columns: 1fr; } }
+  .chart-card h3 { margin: 0 0 8px; font-size: 13px; }
+  .chart-card svg text { font-family: var(--ui); }
+  .bar-label { fill: var(--ink); font-size: 11px; }
+  .bar-count { fill: var(--muted); font-size: 11px; }
+  .bar-rect { fill: var(--accent); opacity: .75; }
+  .tm-rect { stroke: var(--panel); stroke-width: 1.5; cursor: pointer; }
+  .tm-rect:hover { opacity: .8; }
+  .tm-label { font-size: 11px; pointer-events: none; }
+
+  /* ---- two-pane layouts ---- */
+  .split { display: grid; grid-template-columns: 240px 1fr; gap: 12px; align-items: start; }
+  .side-list { max-height: 76vh; overflow: auto; padding: 8px; }
+  .side-list .item {
+    padding: 4px 8px; border-radius: 6px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px;
+  }
+  .side-list .item:hover { background: var(--panel-2); }
+  .side-list .item.sel { background: var(--sel); color: var(--accent-ink); font-weight: 600; }
+  .side-list input[type="search"] { margin-bottom: 8px; }
+
+  input[type="search"], select {
+    width: 100%; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--panel); color: var(--ink); font: inherit;
+  }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .toolbar input[type="search"] { max-width: 320px; }
+
+  /* ---- tables ---- */
+  .table-scroll { overflow: auto; max-height: 66vh; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 4px 10px; border-bottom: 1px solid var(--line-2); white-space: nowrap; }
+  th {
+    position: sticky; top: 0; background: var(--panel); z-index: 1; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .04em; color: var(--muted); cursor: pointer; user-select: none;
+  }
+  th:hover { color: var(--accent-ink); }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover td { background: var(--panel-2); }
+  td.name { font-weight: 600; }
+  .bool-t { color: var(--ok); } .bool-f { color: var(--err); }
+  .pager { display: flex; gap: 12px; align-items: center; justify-content: flex-end; padding-top: 8px; }
+
+  .detail-row td { background: var(--panel-2); white-space: normal; }
+  .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 6px 2px; }
+  @media (max-width: 900px) { .detail-grid { grid-template-columns: 1fr; } }
+  .edge-line { margin-bottom: 3px; }
+  .edge-field { color: var(--tok-key); font-family: var(--mono); font-size: 12px; }
+  .edge-target { cursor: pointer; text-decoration: underline; text-decoration-color: var(--line); }
+  .edge-target:hover { color: var(--accent-ink); }
+  .edge-dangling { color: var(--err); }
+  pre.json { margin: 0; max-height: 420px; overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; white-space: pre; }
+  .tok-key { color: var(--tok-key); } .tok-str { color: var(--tok-str); }
+  .tok-num { color: var(--tok-num); } .tok-bool { color: var(--tok-bool); } .tok-null { color: var(--tok-null); }
+
+  /* ---- severity ---- */
+  .sev { padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .sev.critical { background: var(--err-bg); color: var(--err); }
+  .sev.warning { background: var(--warn-bg); color: var(--warn); }
+  .sev.info { background: var(--info-bg); color: var(--info); }
+
+  /* ---- relationship graph ---- */
+  .rel-canvas { position: relative; overflow: hidden; border: 1px solid var(--line-2); border-radius: 6px; background: var(--panel-2); height: 70vh; }
+  .rel-canvas svg { display: block; width: 100%; height: 100%; cursor: grab; }
+  .rel-canvas svg.panning { cursor: grabbing; }
+  .rel-legend { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; font-size: 12px; }
+  .rel-legend .chip { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
+  .rel-legend .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .gnode { cursor: pointer; }
+  .gnode text { fill: var(--ink); font-size: 11px; }
+  .gnode.dim { opacity: .25; }
+  .gedge { stroke: var(--faint); stroke-width: 1.1; fill: none; opacity: .45; }
+  .gedge.hl { stroke: var(--accent); opacity: 1; stroke-width: 1.8; }
+  .gedge.dim { opacity: .08; }
+  .tooltip {
+    position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 9px; font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,.18);
+    max-width: 340px; z-index: 5; white-space: nowrap;
+  }
+  .node-info { margin-top: 8px; }
+</style>
+</head>
+<body>
+  <header class="top" id="topbar">
+    <h1>Avi Config Analyzer</h1>
+    <span class="pipeline" id="pipeline">No configuration loaded</span>
+    <span class="spacer"></span>
+    <div class="tabs" role="tablist" id="tabs" hidden>
+      <button class="tab" role="tab" data-view="inventory" aria-selected="true">Inventory</button>
+      <button class="tab" role="tab" data-view="explorer" aria-selected="false">Explorer</button>
+      <button class="tab" role="tab" data-view="relationships" aria-selected="false">Relationships</button>
+      <button class="tab" role="tab" data-view="hygiene" aria-selected="false">Hygiene</button>
+    </div>
+    <button class="btn" id="btn-new" hidden>Load another file</button>
+  </header>
+
+  <main id="main"></main>
+
+  <footer class="privacy">
+    <span class="lock">&#128274;</span>
+    All processing happens locally in this browser tab. This page cannot make network
+    requests &mdash; blocked by its Content-Security-Policy &mdash; so your configuration never leaves this machine.
+  </footer>
+
+<script type="module" id="app">
+/* eslint-disable */
+'use strict';
+
+// ======================================================================
+// refs — the single home for *_ref string parsing. (Port of shared/refs.ts.)
+// ======================================================================
+
+const API_PATH = /\/api\/([a-z0-9_]+)\/([^/?#]+)/i;
+
+export function parseRef(ref) {
+  if (typeof ref !== 'string') return null;
+  const raw = ref.trim();
+  if (raw === '') return null;
+
+  let objectType, uuid, name, tenant, cloud;
+
+  const pathMatch = raw.match(API_PATH);
+  if (pathMatch) {
+    objectType = pathMatch[1].toLowerCase();
+    uuid = decodeSegment(pathMatch[2]);
+  }
+  const hashIdx = raw.indexOf('#');
+  if (hashIdx !== -1) {
+    const frag = raw.slice(hashIdx + 1);
+    if (frag !== '') name = decodeSegment(frag);
+  }
+  const qIdx = raw.indexOf('?');
+  if (qIdx !== -1) {
+    const qs = hashIdx !== -1 && hashIdx > qIdx ? raw.slice(qIdx + 1, hashIdx) : raw.slice(qIdx + 1);
+    for (const pair of qs.split('&')) {
+      const eq = pair.indexOf('=');
+      if (eq === -1) continue;
+      const key = pair.slice(0, eq);
+      const val = decodeSegment(pair.slice(eq + 1));
+      if (val === '') continue;
+      if (key === 'name') name = val;
+      else if (key === 'tenant') tenant = val;
+      else if (key === 'cloud') cloud = val;
+    }
+  }
+  if (!pathMatch && name === undefined && qIdx === -1 && hashIdx === -1) name = raw;
+
+  const out = { raw };
+  if (objectType !== undefined) out.objectType = objectType;
+  if (uuid !== undefined) out.uuid = uuid;
+  if (name !== undefined) out.name = name;
+  if (tenant !== undefined) out.tenant = tenant;
+  if (cloud !== undefined) out.cloud = cloud;
+  return out;
+}
+
+/** Display name for a ref; falls back to uuid, then the raw string. */
+export function refName(ref) {
+  const parsed = parseRef(ref);
+  if (!parsed) return '';
+  return parsed.name ?? parsed.uuid ?? parsed.raw;
+}
+
+/**
+ * Avi uuids are type-prefixed ("pool-<uuid>"). Return the id plus its
+ * prefix-stripped variant so the resolver matches either convention.
+ * ASSUMPTION: the prefix is a type token (letters) followed by one '-'.
+ */
+export function uuidVariants(id) {
+  const variants = [id];
+  const dash = id.indexOf('-');
+  if (dash > 0 && /^[a-z][a-z0-9_]*$/i.test(id.slice(0, dash))) variants.push(id.slice(dash + 1));
+  return variants;
+}
+
+export function isRefKey(key) {
+  return key === 'ref' || key.endsWith('_ref') || key.endsWith('_refs');
+}
+
+function decodeSegment(s) {
+  try { return decodeURIComponent(s); } catch { return s; }
+}
+
+// ======================================================================
+// avi — open object model accessors. (Port of shared/avi-types.ts.)
+// ======================================================================
+
+export function getString(o, key) {
+  const v = o[key];
+  return typeof v === 'string' ? v : undefined;
+}
+export function getBool(o, key) {
+  const v = o[key];
+  return typeof v === 'boolean' ? v : undefined;
+}
+export function isScalar(v) {
+  return v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
+}
+/** Identified (worth indexing) = carries a name or uuid. */
+export function hasIdentity(o) {
+  if (o === null || typeof o !== 'object' || Array.isArray(o)) return false;
+  const n = o.name, u = o.uuid;
+  const nOk = typeof n === 'string' ? n.trim() !== '' : n != null;
+  const uOk = typeof u === 'string' ? u.trim() !== '' : u != null;
+  return nOk || uOk;
+}
+
+// ======================================================================
+// scanner — streaming depth-counting slicer.
+//
+// The export is one large JSON object: { "VirtualService": [ {...}, ... ],
+// "META": {...} }. We must never JSON.parse the whole file (a 200 MB dump
+// balloons to multi-GB of live objects). Instead: scan the byte stream,
+// depth-count to find each array element's exact character range, and hand
+// that SLICE to native JSON.parse. Native parse runs at ~350 MB/s vs ~43 MB/s
+// for a JS tokenizer (measured), and transient memory stays O(largest object).
+// The raw slice is also kept per object (see Dataset) — serialization for free.
+//
+// Intentional degradations (documented, not accidental):
+//  - scalar array elements are skipped (they carry no identity; the previous
+//    pipeline emitted then discarded them),
+//  - top-level scalar values are ignored (META is always an object in practice).
+// ======================================================================
+
+export class ConfigScanner {
+  /** handlers: { onObject(type, obj, rawSlice), onMeta(key, value) } */
+  constructor(handlers) {
+    this.h = handlers;
+    this.buf = '';
+    this.scanFrom = 0;       // index in buf we have scanned up to
+    this.baseOffset = 0;     // absolute char offset of buf[0] (for error messages)
+    this.depth = 0;
+    this.inStr = false;
+    this.esc = false;
+    this.rootOpened = false;
+    this.inArray = false;    // inside a top-level type array
+    this.arrayType = null;
+    this.lastKey = null;     // last string seen at depth 1 (candidate key)
+    this.pendingKey = null;  // key whose value we are expecting
+    this.expectValue = false;
+    this.keyBuf = '';        // accumulates depth-1 strings across chunks
+    this.keyOverflow = false;
+    this.sliceStart = -1;    // start of the element / meta slice being captured
+    this.sliceMode = null;   // 'elem' | 'meta'
+  }
+
+  feed(text) {
+    this.buf += text;
+    const buf = this.buf;
+    let i = this.scanFrom;
+    for (; i < buf.length; i++) {
+      const c = buf.charCodeAt(i);
+
+      if (this.inStr) {
+        if (this.esc) this.esc = false;
+        else if (c === 92 /* \ */) this.esc = true;
+        else if (c === 34 /* " */) {
+          this.inStr = false;
+          if (this.depth === 1 && this.sliceStart < 0) this.closeTopString();
+        } else if (this.depth === 1 && this.sliceStart < 0 && !this.keyOverflow) {
+          if (this.keyBuf.length < 4096) this.keyBuf += buf[i];
+          else this.keyOverflow = true;
+        }
+        continue;
+      }
+
+      switch (c) {
+        case 34: /* " */
+          this.inStr = true;
+          if (this.depth === 1 && this.sliceStart < 0) { this.keyBuf = ''; this.keyOverflow = false; }
+          break;
+        case 123: /* { */
+          if (this.depth === 0) {
+            this.rootOpened = true;
+          } else if (this.depth === 1 && this.expectValue && this.sliceStart < 0) {
+            this.sliceStart = i; this.sliceMode = 'meta'; this.expectValue = false;
+          } else if (this.depth === 2 && this.inArray && this.sliceStart < 0) {
+            this.sliceStart = i; this.sliceMode = 'elem';
+          }
+          this.depth++;
+          break;
+        case 91: /* [ */
+          if (this.depth === 0) this.fail(i, 'file is a JSON array — expected an Avi export shaped like {"VirtualService": [...], ...}');
+          if (this.depth === 1 && this.expectValue && this.sliceStart < 0) {
+            this.inArray = true; this.arrayType = this.pendingKey; this.expectValue = false;
+          }
+          this.depth++;
+          break;
+        case 125: /* } */
+        case 93: /* ] */
+          this.depth--;
+          if (this.depth < 0) this.fail(i, 'unbalanced brackets');
+          if (this.sliceStart >= 0) {
+            if (this.sliceMode === 'elem' && this.depth === 2 && c === 125) this.emitElem(i);
+            else if (this.sliceMode === 'meta' && this.depth === 1) this.emitMeta(i);
+          }
+          if (c === 93 && this.inArray && this.depth === 1) { this.inArray = false; this.arrayType = null; }
+          break;
+        case 58: /* : */
+          if (this.depth === 1 && this.sliceStart < 0) {
+            this.pendingKey = this.lastKey; this.expectValue = true;
+          }
+          break;
+        case 44: /* , */
+          // A top-level scalar we did not capture (number/bool/null) ends here;
+          // clear expectValue so the next string is read as a key, not a value.
+          if (this.depth === 1 && this.sliceStart < 0) this.expectValue = false;
+          break;
+        default:
+          if (this.depth === 0 && !this.rootOpened && c > 32 && c !== 0xfeff) {
+            this.fail(i, 'file does not start with a JSON object — expected an Avi export shaped like {"VirtualService": [...], ...}');
+          }
+      }
+    }
+    // Trim consumed input; keep only an unfinished slice (or nothing).
+    if (this.sliceStart >= 0) {
+      this.baseOffset += this.sliceStart;
+      this.buf = buf.slice(this.sliceStart);
+      this.sliceStart = 0;
+      this.scanFrom = this.buf.length;
+    } else {
+      this.baseOffset += buf.length;
+      this.buf = '';
+      this.scanFrom = 0;
+    }
+  }
+
+  end() {
+    if (!this.rootOpened) this.fail(0, 'file is empty or not JSON');
+    if (this.depth !== 0 || this.inStr || this.sliceStart >= 0) this.fail(this.buf.length, 'unexpected end of file (truncated export?)');
+  }
+
+  closeTopString() {
+    const key = this.keyOverflow ? null : this.decodeKey(this.keyBuf);
+    if (this.expectValue) {
+      // Top-level scalar string value — ignored (see header note).
+      this.expectValue = false;
+    } else {
+      this.lastKey = key;
+    }
+  }
+
+  decodeKey(raw) {
+    if (!raw.includes('\\')) return raw;
+    try { return JSON.parse('"' + raw + '"'); } catch { return raw; }
+  }
+
+  emitElem(i) {
+    const slice = this.buf.slice(this.sliceStart, i + 1);
+    this.sliceStart = -1; this.sliceMode = null;
+    let obj;
+    try { obj = JSON.parse(slice); }
+    catch (e) { this.fail(i, 'malformed object in "' + this.arrayType + '": ' + e.message); }
+    this.h.onObject(this.arrayType, obj, slice);
+  }
+
+  emitMeta(i) {
+    const slice = this.buf.slice(this.sliceStart, i + 1);
+    const key = this.pendingKey;
+    this.sliceStart = -1; this.sliceMode = null; this.pendingKey = null;
+    let value;
+    try { value = JSON.parse(slice); }
+    catch (e) { this.fail(i, 'malformed value for "' + key + '": ' + e.message); }
+    if (key != null && this.h.onMeta) this.h.onMeta(key, value);
+  }
+
+  fail(i, msg) {
+    const err = new Error(msg);
+    err.offset = this.baseOffset + i;
+    throw err;
+  }
+}
+
+/**
+ * Parse a Blob/File through ConfigScanner. Reads via blob.stream(), so each
+ * chunk await yields to the event loop and progress can paint. onProgress is
+ * called with (bytesRead, totalBytes) at most every ~80 ms.
+ */
+export async function scanBlob(blob, handlers, onProgress) {
+  const scanner = new ConfigScanner(handlers);
+  const reader = blob.stream().getReader();
+  const decoder = new TextDecoder();
+  let read = 0;
+  let lastTick = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    read += value.byteLength;
+    scanner.feed(decoder.decode(value, { stream: true }));
+    const now = Date.now();
+    if (onProgress && (now - lastTick > 80 || read === blob.size)) {
+      lastTick = now;
+      onProgress(read, blob.size);
+    }
+  }
+  const tail = decoder.decode();
+  if (tail) scanner.feed(tail);
+  scanner.end();
+}
+
+// ======================================================================
+// graph — lightweight nodes + resolved edges. (Port of server/ref-graph.ts;
+// the unreachable anonymous-id branch is gone: hasIdentity gates addObject.)
+// ======================================================================
+
+const SEP = ' ';
+const MAX_GRAPH_NODES = 2000;
+const MAX_GRAPH_DEPTH = 12;
+
+export class RefGraph {
+  constructor() {
+    this.nodes = new Map();       // canonical uuid -> {uuid,type,name,tenant,cloud}
+    this.byUuid = new Map();      // every uuid variant -> canonical
+    this.byTypeName = new Map();  // type\0name -> canonical (first writer wins)
+    this.byType = new Map();      // type -> canonical uuids
+    this.pendingEdges = [];
+    this.outgoing = new Map();
+    this.incoming = new Map();
+    this.danglingList = [];
+    this.edgeCount = 0;
+    this.danglingCount = 0;
+    this.resolved = false;
+  }
+
+  get size() { return this.nodes.size; }
+  get edges() { return this.edgeCount; }
+  get dangling() { return this.danglingCount; }
+
+  /** Phase 1: register an object; stash raw edge specs. Returns canonical uuid or null. */
+  addObject(type, obj) {
+    if (!hasIdentity(obj)) return null;
+    const uuidField = getString(obj, 'uuid');
+    const name = getString(obj, 'name') ?? null;
+    const canonical = uuidField ?? type + ':name:' + name;
+
+    const node = {
+      uuid: canonical, type, name,
+      tenant: refName(obj.tenant_ref) || null,
+      cloud: refName(obj.cloud_ref) || null,
+    };
+    const isNew = !this.nodes.has(canonical);
+    this.nodes.set(canonical, node);
+
+    if (uuidField) for (const v of uuidVariants(uuidField)) this.byUuid.set(v, canonical);
+    this.byUuid.set(canonical, canonical);
+    if (name) {
+      const key = type.toLowerCase() + SEP + name;
+      if (!this.byTypeName.has(key)) this.byTypeName.set(key, canonical);
+    }
+    if (isNew) {
+      const list = this.byType.get(type);
+      if (list) list.push(canonical); else this.byType.set(type, [canonical]);
+    }
+
+    collectRefs(obj, '', (field, refStr) => {
+      const parsed = parseRef(refStr);
+      if (!parsed) return;
+      this.pendingEdges.push({
+        from: canonical, field,
+        refName: parsed.name ?? null,
+        targetUuid: parsed.uuid,
+        targetType: parsed.objectType,
+        targetName: parsed.name,
+      });
+    });
+    return canonical;
+  }
+
+  /** Phase 2: resolve all stashed edges, uuid-first with type+name fallback. */
+  resolve() {
+    if (this.resolved) return;
+    for (const spec of this.pendingEdges) {
+      let to = null, resolvedBy = 'none';
+      if (spec.targetUuid !== undefined) {
+        for (const v of uuidVariants(spec.targetUuid)) {
+          const hit = this.byUuid.get(v);
+          if (hit !== undefined) { to = hit; resolvedBy = 'uuid'; break; }
+        }
+      }
+      if (to === null && spec.targetType !== undefined && spec.targetName !== undefined) {
+        const hit = this.byTypeName.get(spec.targetType.toLowerCase() + SEP + spec.targetName);
+        if (hit !== undefined) { to = hit; resolvedBy = 'name'; }
+      }
+      const edge = { field: spec.field, from: spec.from, to, refName: spec.refName, resolvedBy };
+      pushEdge(this.outgoing, spec.from, edge);
+      if (to !== null) pushEdge(this.incoming, to, edge);
+      else { this.danglingList.push(edge); this.danglingCount++; }
+      this.edgeCount++;
+    }
+    this.pendingEdges.length = 0;
+    this.resolved = true;
+  }
+
+  canonicalize(uuid) {
+    if (this.nodes.has(uuid)) return uuid;
+    return this.byUuid.get(uuid);
+  }
+  getNode(uuid) {
+    const c = this.canonicalize(uuid);
+    return c === undefined ? null : (this.nodes.get(c) ?? null);
+  }
+  outgoingOf(uuid) {
+    const c = this.canonicalize(uuid);
+    return (c && this.outgoing.get(c)) || [];
+  }
+  incomingOf(uuid) {
+    const c = this.canonicalize(uuid);
+    return (c && this.incoming.get(c)) || [];
+  }
+  orphansOfType(type) {
+    const out = [];
+    for (const uuid of this.byType.get(type) ?? []) {
+      const node = this.nodes.get(uuid);
+      if (node && this.incomingOf(uuid).length === 0) out.push(node);
+    }
+    return out;
+  }
+  allOfType(type) {
+    const out = [];
+    for (const uuid of this.byType.get(type) ?? []) {
+      const node = this.nodes.get(uuid);
+      if (node) out.push(node);
+    }
+    return out;
+  }
+  danglingEdges() { return this.danglingList; }
+
+  /** Object types present, largest first. */
+  types() {
+    const out = [];
+    for (const [type, list] of this.byType) out.push({ key: type, count: list.length });
+    out.sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
+    return out;
+  }
+
+  /**
+   * BFS dependency chain from rootUuid over outgoing edges; depth- and
+   * size-capped so a pathological graph cannot produce an unbounded result.
+   */
+  dependencyGraph(rootUuid, maxDepth = MAX_GRAPH_DEPTH) {
+    const root = this.canonicalize(rootUuid);
+    if (root === undefined) return null;
+    const depthOf = new Map([[root, 0]]);
+    const nodesOut = [];
+    const edgesOut = [];
+    const queue = [root];
+    let head = 0;
+    let truncated = false;
+    const rootNode = this.nodes.get(root);
+    if (rootNode) nodesOut.push({ ...rootNode, depth: 0 });
+    while (head < queue.length) {
+      const cur = queue[head++];
+      const d = depthOf.get(cur) ?? 0;
+      if (d >= maxDepth) { truncated = true; continue; }
+      for (const edge of this.outgoingOf(cur)) {
+        edgesOut.push(edge);
+        if (edge.to === null) continue;
+        if (!depthOf.has(edge.to)) {
+          if (nodesOut.length >= MAX_GRAPH_NODES) { truncated = true; continue; }
+          depthOf.set(edge.to, d + 1);
+          const n = this.nodes.get(edge.to);
+          if (n) nodesOut.push({ ...n, depth: d + 1 });
+          queue.push(edge.to);
+        }
+      }
+    }
+    return { root, nodes: nodesOut, edges: edgesOut, truncated };
+  }
+}
+
+function pushEdge(map, key, edge) {
+  const arr = map.get(key);
+  if (arr) arr.push(edge); else map.set(key, [edge]);
+}
+
+/** Recursively collect `*_ref` / `*_refs` fields at any depth (dotted path). */
+function collectRefs(value, path, emit) {
+  if (value === null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectRefs(item, path, emit);
+    return;
+  }
+  for (const key of Object.keys(value)) {
+    const v = value[key];
+    const here = path ? path + '.' + key : key;
+    if (isRefKey(key)) {
+      if (typeof v === 'string') emit(here, v);
+      else if (Array.isArray(v)) { for (const el of v) if (typeof el === 'string') emit(here, el); }
+      else if (v && typeof v === 'object') collectRefs(v, here, emit);
+    } else if (v && typeof v === 'object') {
+      collectRefs(v, here, emit);
+    }
+  }
+}
+
+// ======================================================================
+// columns — pick informative scalar columns per type. (Port of util/columns.ts.)
+// ======================================================================
+
+const BASE_SKIP = new Set([
+  'name', 'uuid', 'tenant_ref', 'cloud_ref', 'url', 'configpb_attributes',
+  '_last_modified', 'labels', 'markers',
+]);
+const PREFERRED = { type: 5, enabled: 4, is_federated: 2, os_type: 2, vrf: 2, ssl_profile_ref: 1 };
+const MAX_COLUMNS = 4;
+
+export function detectColumns(sample) {
+  const present = {}, scalar = {};
+  const n = Math.min(sample.length, 100);
+  for (let i = 0; i < n; i++) {
+    const o = sample[i];
+    if (!o) continue;
+    for (const k of Object.keys(o)) {
+      if (BASE_SKIP.has(k)) continue;
+      const v = o[k];
+      present[k] = (present[k] ?? 0) + 1;
+      if (isScalar(v) || (typeof v === 'string' && k.endsWith('_ref'))) scalar[k] = (scalar[k] ?? 0) + 1;
+    }
+  }
+  const candidates = Object.keys(present).filter((k) => (scalar[k] ?? 0) >= (present[k] ?? 1) * 0.6);
+  candidates.sort((a, b) => {
+    const pa = PREFERRED[a] ?? 0, pb = PREFERRED[b] ?? 0;
+    if (pb !== pa) return pb - pa;
+    const sa = scalar[a] ?? 0, sb = scalar[b] ?? 0;
+    if (sb !== sa) return sb - sa;
+    return a.localeCompare(b);
+  });
+  return candidates.slice(0, MAX_COLUMNS);
+}
+
+export function cellValue(o, key) {
+  const v = o[key];
+  if (v === undefined || v === null) return null;
+  if (typeof v === 'string') return key.endsWith('_ref') ? refName(v) : v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (Array.isArray(v)) return '[' + v.length + ']';
+  if (typeof v === 'object') return '{…}';
+  return String(v);
+}
+
+// ======================================================================
+// dataset — the in-memory "store": one raw text slice per object, parsed on
+// demand. Replaces SQLite + DuckDB + the REST layer. Sorting/filtering over
+// 40k lightweight rows is ~10 ms; SQL was never the bottleneck.
+// ======================================================================
+
+export class Dataset {
+  constructor() {
+    this.graph = new RefGraph();
+    this.raws = new Map();     // canonical uuid -> raw JSON slice
+    this.meta = {};            // top-level non-array values (META, ...)
+    this.fileName = '';
+    this.bytes = 0;
+    this.parseMs = 0;
+    this.objectCount = 0;
+    this._columns = new Map();     // type -> string[]
+    this._colValues = new Map();   // type\0col -> Map(uuid -> string|null)
+    this._inventory = null;
+    this._hygiene = null;
+  }
+
+  /** Parse a raw slice on demand. Returns {} for unknown uuids. */
+  getObj(uuid) {
+    const raw = this.raws.get(uuid);
+    if (raw === undefined) return {};
+    try { return JSON.parse(raw); } catch { return {}; }
+  }
+  getRaw(uuid) { return this.raws.get(uuid); }
+
+  columnsFor(type) {
+    let cols = this._columns.get(type);
+    if (cols) return cols;
+    const nodes = this.graph.allOfType(type);
+    const sample = [];
+    for (let i = 0; i < Math.min(nodes.length, 100); i++) sample.push(this.getObj(nodes[i].uuid));
+    cols = detectColumns(sample);
+    this._columns.set(type, cols);
+    return cols;
+  }
+
+  /**
+   * All values of one column for one type (for sorting). Built lazily; parses
+   * every object of the type once, in chunks, yielding between chunks so a
+   * 20k-object type cannot freeze the tab.
+   */
+  async columnValues(type, col) {
+    const key = type + SEP + col;
+    let m = this._colValues.get(key);
+    if (m) return m;
+    m = new Map();
+    const nodes = this.graph.allOfType(type);
+    for (let i = 0; i < nodes.length; i++) {
+      m.set(nodes[i].uuid, cellValue(this.getObj(nodes[i].uuid), col));
+      if (i % 2000 === 1999) await new Promise((r) => setTimeout(r, 0));
+    }
+    this._colValues.set(key, m);
+    return m;
+  }
+
+  inventory() {
+    if (this._inventory) return this._inventory;
+    const byTenant = new Map(), byCloud = new Map();
+    for (const node of this.graph.nodes.values()) {
+      const t = node.tenant ?? '(none)', c = node.cloud ?? '(none)';
+      byTenant.set(t, (byTenant.get(t) ?? 0) + 1);
+      byCloud.set(c, (byCloud.get(c) ?? 0) + 1);
+    }
+    const toBuckets = (m) => [...m.entries()]
+      .map(([key, count]) => ({ key, count }))
+      .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
+    this._inventory = {
+      total: this.graph.size,
+      byType: this.graph.types(),
+      byTenant: toBuckets(byTenant),
+      byCloud: toBuckets(byCloud),
+    };
+    return this._inventory;
+  }
+
+  hygiene() {
+    if (!this._hygiene) this._hygiene = runHygiene(this);
+    return this._hygiene;
+  }
+
+  /** Version string from META, when present. */
+  version() {
+    const meta = this.meta.META;
+    if (meta && typeof meta === 'object') {
+      const v = meta.version;
+      if (v && typeof v === 'object' && v.Version != null) return String(v.Version);
+    }
+    return null;
+  }
+}
+
+/** Ingest a Blob/File into a Dataset. One pass: scan -> graph + raw slices. */
+export async function ingestBlob(blob, fileName, onProgress) {
+  const started = Date.now();
+  const ds = new Dataset();
+  ds.fileName = fileName;
+  ds.bytes = blob.size;
+  await scanBlob(blob, {
+    onObject: (type, obj, slice) => {
+      const uuid = ds.graph.addObject(type, obj);
+      if (uuid !== null) { ds.raws.set(uuid, slice); ds.objectCount++; }
+    },
+    onMeta: (key, value) => { ds.meta[key] = value; },
+  }, onProgress);
+  ds.graph.resolve();
+  ds.parseMs = Date.now() - started;
+  return ds;
+}
+
+// ======================================================================
+// hygiene — pure rules over (dataset, graph). Exact counts always; at most
+// MAX_EXEMPLARS findings retained per rule so a partial export with 80k
+// dangling refs produces a bounded report, not a frozen tab.
+// ======================================================================
+
+const EXPIRY_WARN_DAYS = 30;
+const DEFAULT_CERT_NAMES = new Set(['System-Default-Cert', 'System-Default-Cert-EC']);
+export const MAX_EXEMPLARS = 500;
+
+export function runHygiene(ds) {
+  const graph = ds.graph;
+  const rules = new Map(); // ruleId -> {ruleId, severity, title, count, findings[]}
+
+  const add = (ruleId, severity, title, subject, detail) => {
+    let r = rules.get(ruleId);
+    if (!r) { r = { ruleId, severity, title, count: 0, findings: [] }; rules.set(ruleId, r); }
+    r.count++;
+    if (r.findings.length < MAX_EXEMPLARS) r.findings.push({ ruleId, severity, title, subject, detail });
+  };
+
+  for (const node of graph.orphansOfType('Pool')) {
+    add('orphaned-pool', 'warning', 'Orphaned pool', node,
+      'Pool has no incoming references (no VirtualService, PoolGroup, or policy uses it).');
+  }
+  for (const node of graph.orphansOfType('PoolGroup')) {
+    add('orphaned-poolgroup', 'warning', 'Orphaned pool group', node,
+      'PoolGroup is not referenced by any VirtualService or policy.');
+  }
+  for (const node of graph.orphansOfType('HealthMonitor')) {
+    add('unused-healthmonitor', 'info', 'Unused health monitor', node,
+      'HealthMonitor is not attached to any pool.');
+  }
+  for (const node of graph.orphansOfType('SSLKeyAndCertificate')) {
+    add('unused-certificate', 'info', 'Unused certificate', node,
+      'Certificate is not referenced by any VirtualService or SSL profile.');
+  }
+
+  for (const node of graph.allOfType('VirtualService')) {
+    const o = ds.getObj(node.uuid);
+    if (getBool(o, 'enabled') === false) {
+      add('disabled-virtualservice', 'info', 'Disabled virtual service', node,
+        'VirtualService is administratively disabled (enabled=false).');
+    }
+    // ASSUMPTION: a VS "using" a cert exposes it via ssl_key_and_certificate_refs.
+    const certRefs = o.ssl_key_and_certificate_refs;
+    if (Array.isArray(certRefs)) {
+      for (const ref of certRefs) {
+        const name = refName(ref);
+        if (name && DEFAULT_CERT_NAMES.has(name)) {
+          add('default-certificate-in-use', 'warning', 'Default certificate in use', node,
+            'VirtualService serves TLS with the built-in "' + name + '". Replace with a CA-signed certificate.');
+        }
+      }
+    }
+  }
+
+  for (const node of graph.allOfType('SSLKeyAndCertificate')) {
+    const o = ds.getObj(node.uuid);
+    const notAfter = extractNotAfter(o);
+    if (notAfter === null) continue;
+    const ms = notAfter.getTime() - Date.now();
+    const days = Math.floor(ms / 86_400_000);
+    if (ms < 0) {
+      add('expired-certificate', 'critical', 'Expired certificate', node,
+        'Certificate expired ' + Math.abs(days) + ' day(s) ago (not_after ' + notAfter.toISOString() + ').');
+    } else if (days <= EXPIRY_WARN_DAYS) {
+      add('expiring-certificate', 'warning', 'Certificate expiring soon', node,
+        'Certificate expires in ' + days + ' day(s) (not_after ' + notAfter.toISOString() + ').');
+    }
+  }
+
+  for (const edge of graph.danglingEdges()) {
+    const subject = graph.getNode(edge.from);
+    if (!subject) continue;
+    add('dangling-reference', 'critical', 'Dangling reference', subject,
+      'Field "' + edge.field + '" points at ' + (edge.refName ? '"' + edge.refName + '"' : 'an object')
+      + ' that is not present in this export.');
+    if (rules.get('dangling-reference').count >= 1_000_000) break; // absolute backstop
+  }
+
+  const ruleList = [...rules.values()];
+  const sevOrder = { critical: 0, warning: 1, info: 2 };
+  ruleList.sort((a, b) => sevOrder[a.severity] - sevOrder[b.severity] || a.ruleId.localeCompare(b.ruleId));
+  const countsBySeverity = { critical: 0, warning: 0, info: 0 };
+  let total = 0;
+  for (const r of ruleList) { countsBySeverity[r.severity] += r.count; total += r.count; }
+  return { generatedAt: new Date().toISOString(), rules: ruleList, countsBySeverity, total };
+}
+
+/**
+ * ASSUMPTION: SSLKeyAndCertificate carries certificate.not_after; Avi has used
+ * both "2025-12-31 23:59:59" and ISO-8601 forms — Date parses both.
+ */
+function extractNotAfter(o) {
+  const cert = o.certificate;
+  if (!cert || typeof cert !== 'object') return null;
+  const notAfter = cert.not_after;
+  if (typeof notAfter !== 'string') return null;
+  const d = new Date(notAfter);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+// ======================================================================
+// ui — everything below touches the DOM and only runs in a browser.
+// ======================================================================
+
+if (typeof document !== 'undefined' && document.getElementById('main')) boot();
+
+function boot() {
+  const $main = document.getElementById('main');
+  const $tabs = document.getElementById('tabs');
+  const $pipeline = document.getElementById('pipeline');
+  const $btnNew = document.getElementById('btn-new');
+
+  /** @type {Dataset|null} */
+  let ds = null;
+  let view = 'inventory';
+  // Per-view UI state survives tab switches (feedback/consistency).
+  const explorerState = { type: null, search: '', sort: 'name', dir: 'asc', page: 0, openUuid: null };
+  const relState = { root: null, search: '' };
+  const hygState = { severity: 'all', rule: 'all', page: 0 };
+
+  // ---- shell wiring ----
+  $tabs.addEventListener('click', (e) => {
+    const btn = e.target.closest('.tab');
+    if (!btn) return;
+    view = btn.dataset.view;
+    for (const t of $tabs.querySelectorAll('.tab')) t.setAttribute('aria-selected', String(t === btn));
+    render();
+  });
+  $btnNew.addEventListener('click', () => { ds = null; renderShell(); render(); });
+
+  function renderShell() {
+    $tabs.hidden = !ds;
+    $btnNew.hidden = !ds;
+    if (!ds) { $pipeline.textContent = 'No configuration loaded'; return; }
+    const g = ds.graph;
+    const ver = ds.version();
+    $pipeline.innerHTML = '';
+    $pipeline.append(
+      el('span', {}, [ds.fileName + ' — ']),
+      el('b', {}, [fmt(ds.objectCount)]), ' objects · ',
+      el('b', {}, [fmt(g.edges)]), ' references · ',
+      el('b', { style: g.dangling > 0 ? 'color: var(--err)' : '' }, [fmt(g.dangling)]), ' dangling',
+      ver ? ' · v' + ver : '',
+    );
+  }
+
+  function render() {
+    $main.innerHTML = '';
+    if (!ds) { $main.append(uploadView()); return; }
+    if (view === 'inventory') $main.append(inventoryView());
+    else if (view === 'explorer') $main.append(explorerView());
+    else if (view === 'relationships') $main.append(relationshipsView());
+    else if (view === 'hygiene') $main.append(hygieneView());
+  }
+
+  // ---- upload ----
+  function uploadView() {
+    const input = el('input', { type: 'file', accept: '.json,application/json', style: 'display:none' });
+    const zone = el('div', { class: 'dropzone', role: 'button', tabindex: '0', 'aria-label': 'Choose or drop an Avi configuration export' }, [
+      el('div', { class: 'big' }, ['Drop an Avi configuration export here']),
+      el('div', { class: 'muted' }, ['…or click to choose a file. This is the JSON export from the controller ("Export configuration"), the one shaped like {"VirtualService": […], "Pool": […]}.']),
+    ]);
+    const errBox = el('div', {});
+    const wrap = el('div', { class: 'center-col' }, [
+      zone, input, errBox,
+      el('div', { class: 'privacy-note' }, [
+        el('span', { class: 'lock', style: 'color:var(--ok)' }, ['\u{1F512}']),
+        el('span', {}, ['Files are parsed in this tab and never uploaded — this page cannot make network requests.']),
+      ]),
+    ]);
+
+    const start = (file) => { if (file) loadFile(file, wrap, zone, errBox); };
+    zone.addEventListener('click', () => input.click());
+    zone.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); } });
+    input.addEventListener('change', () => start(input.files[0]));
+    zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('drag'); });
+    zone.addEventListener('dragleave', () => zone.classList.remove('drag'));
+    zone.addEventListener('drop', (e) => {
+      e.preventDefault(); zone.classList.remove('drag');
+      start(e.dataTransfer.files[0]);
+    });
+    return wrap;
+  }
+
+  async function loadFile(file, wrap, zone, errBox) {
+    errBox.innerHTML = '';
+    const bar = el('div', {});
+    const label = el('div', { class: 'muted', role: 'status' }, ['Reading ' + file.name + '…']);
+    const progress = el('div', { class: 'progress-wrap card' }, [
+      label,
+      el('div', { class: 'progress-bar', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': '100' }, [bar]),
+    ]);
+    zone.replaceWith(progress);
+    const t0 = Date.now();
+    try {
+      const loaded = await ingestBlob(file, file.name, (read, total) => {
+        const pct = total ? Math.round((read / total) * 100) : 0;
+        bar.style.width = pct + '%';
+        progress.querySelector('[role=progressbar]').setAttribute('aria-valuenow', String(pct));
+        const mbs = read / 1e6 / Math.max(0.001, (Date.now() - t0) / 1000);
+        label.textContent = 'Parsing ' + file.name + ' — ' + fmtMB(read) + ' of ' + fmtMB(total) + ' (' + mbs.toFixed(0) + ' MB/s)';
+      });
+      if (loaded.objectCount === 0) {
+        throw Object.assign(new Error('no identified objects found — is this an Avi configuration export?'), { offset: 0 });
+      }
+      ds = loaded;
+      explorerState.type = null; explorerState.page = 0; explorerState.openUuid = null; explorerState.search = '';
+      relState.root = null; relState.search = '';
+      hygState.severity = 'all'; hygState.rule = 'all'; hygState.page = 0;
+      view = 'inventory';
+      for (const t of $tabs.querySelectorAll('.tab')) t.setAttribute('aria-selected', String(t.dataset.view === 'inventory'));
+      renderShell();
+      render();
+    } catch (err) {
+      progress.replaceWith(zone);
+      errBox.innerHTML = '';
+      errBox.append(el('div', { class: 'error-box', role: 'alert' }, [
+        el('div', {}, ['Could not read this file as an Avi configuration export. Nothing was changed — fix or re-export the file and drop it again.']),
+        el('details', {}, [
+          el('summary', {}, ['Technical detail']),
+          el('div', { class: 'mono' }, [String(err.message) + (err.offset != null ? ' (near character ' + fmt(err.offset) + ')' : '')]),
+        ]),
+      ]));
+    }
+  }
+
+  // ---- inventory ----
+  function inventoryView() {
+    const inv = ds.inventory();
+    const wrap = el('div', {});
+    const stats = el('div', { class: 'stat-row' }, [
+      stat('Objects', fmt(inv.total)),
+      stat('Types', String(inv.byType.length)),
+      stat('Tenants', String(inv.byTenant.length)),
+      stat('Clouds', String(inv.byCloud.length)),
+      stat('References', fmt(ds.graph.edges)),
+      stat('Dangling refs', fmt(ds.graph.dangling), ds.graph.dangling > 0 ? 'need attention' : 'clean'),
+    ]);
+    const ver = ds.version();
+    if (ver) stats.append(stat('Version', ver));
+    wrap.append(stats);
+
+    const openType = (type) => {
+      explorerState.type = type; explorerState.page = 0; explorerState.search = ''; explorerState.openUuid = null;
+      switchTo('explorer');
+    };
+
+    wrap.append(el('div', { class: 'charts' }, [
+      el('div', { class: 'card chart-card' }, [
+        el('h3', {}, ['Objects by type', el('span', { class: 'faint' }, [' — click to explore'])]),
+        treemapSvg(inv.byType, openType),
+      ]),
+      el('div', { class: 'card chart-card' }, [el('h3', {}, ['By tenant']), barsSvg(inv.byTenant)]),
+      el('div', { class: 'card chart-card' }, [el('h3', {}, ['By cloud']), barsSvg(inv.byCloud)]),
+    ]));
+    return wrap;
+  }
+
+  function stat(k, v, sub) {
+    return el('div', { class: 'stat' }, [
+      el('div', { class: 'k' }, [k]),
+      el('div', { class: 'v' }, [v, sub ? el('small', {}, [' ' + sub]) : '']),
+    ]);
+  }
+
+  // ---- explorer ----
+  function explorerView() {
+    const inv = ds.inventory();
+    if (explorerState.type === null) explorerState.type = inv.byType[0]?.key ?? null;
+    const st = explorerState;
+
+    const listPane = el('div', { class: 'card side-list' }, [
+      el('div', { class: 'k', style: 'margin-bottom:8px' }, ['Object types']),
+      ...inv.byType.map((t) => el('div', {
+        class: 'item' + (st.type === t.key ? ' sel' : ''),
+        onclick: () => { st.type = t.key; st.page = 0; st.openUuid = null; st.sort = 'name'; st.dir = 'asc'; render(); },
+      }, [el('span', { class: 'mono' }, [t.key]), el('span', { class: 'muted' }, [fmt(t.count)])])),
+    ]);
+
+    const tablePane = el('div', { class: 'card' });
+    const wrap = el('div', { class: 'split' }, [listPane, tablePane]);
+    renderExplorerTable(tablePane);
+    return wrap;
+  }
+
+  async function renderExplorerTable(pane) {
+    const st = explorerState;
+    if (!st.type) { pane.append(el('div', { class: 'muted' }, ['No object types found.'])); return; }
+    const cols = ds.columnsFor(st.type);
+    const fixedCols = ['name', 'uuid', 'tenant', 'cloud'];
+    const allCols = [...fixedCols, ...cols];
+
+    // Filter.
+    let rows = ds.graph.allOfType(st.type);
+    const total = rows.length;
+    if (st.search) {
+      const q = st.search.toLowerCase();
+      rows = rows.filter((r) => (r.name ?? '').toLowerCase().includes(q) || r.uuid.toLowerCase().includes(q));
+    }
+
+    // Sort (fixed columns come from lightweight rows; detected columns from the
+    // lazily built column cache, chunked so big types don't freeze the tab).
+    const dirMul = st.dir === 'desc' ? -1 : 1;
+    if (fixedCols.includes(st.sort)) {
+      const k = st.sort;
+      rows = rows.slice().sort((a, b) => dirMul * cmpVals(a[k], b[k]) || cmpVals(a.name, b.name));
+    } else if (cols.includes(st.sort)) {
+      const token = st.type + SEP + st.sort + SEP + st.dir;
+      pane.dataset.sortToken = token;
+      const values = await ds.columnValues(st.type, st.sort);
+      if (pane.dataset.sortToken !== token || !pane.isConnected) return; // superseded
+      rows = rows.slice().sort((a, b) => dirMul * cmpVals(values.get(a.uuid), values.get(b.uuid)) || cmpVals(a.name, b.name));
+    }
+
+    const PAGE = 50;
+    const pages = Math.max(1, Math.ceil(rows.length / PAGE));
+    if (st.page >= pages) st.page = pages - 1;
+    const pageRows = rows.slice(st.page * PAGE, st.page * PAGE + PAGE);
+
+    // Parse only the visible page for cell values.
+    const cells = new Map();
+    for (const r of pageRows) {
+      const o = ds.getObj(r.uuid);
+      cells.set(r.uuid, cols.map((c) => cellValue(o, c)));
+    }
+
+    pane.innerHTML = '';
+    const searchInput = el('input', {
+      type: 'search', placeholder: 'filter by name or uuid…', value: st.search,
+      'aria-label': 'Filter ' + st.type + ' objects by name or uuid',
+    });
+    let debounce = 0;
+    searchInput.addEventListener('input', () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => { st.search = searchInput.value; st.page = 0; renderExplorerTable(pane); }, 150);
+    });
+    pane.append(el('div', { class: 'toolbar' }, [
+      searchInput,
+      el('span', { class: 'muted' }, [
+        fmt(rows.length) + (rows.length !== total ? ' of ' + fmt(total) : '') + ' objects',
+      ]),
+    ]));
+
+    const thead = el('tr', {}, allCols.map((c) => {
+      const active = st.sort === c;
+      return el('th', {
+        scope: 'col',
+        'aria-sort': active ? (st.dir === 'asc' ? 'ascending' : 'descending') : 'none',
+        onclick: () => {
+          if (st.sort === c) st.dir = st.dir === 'asc' ? 'desc' : 'asc';
+          else { st.sort = c; st.dir = 'asc'; }
+          st.page = 0;
+          renderExplorerTable(pane);
+        },
+      }, [c + (active ? (st.dir === 'asc' ? ' ▲' : ' ▼') : '')]);
+    }));
+
+    const tbody = el('tbody', {});
+    for (const r of pageRows) {
+      const tr = el('tr', { class: 'clickable', onclick: () => { st.openUuid = st.openUuid === r.uuid ? null : r.uuid; renderExplorerTable(pane); } }, [
+        el('td', { class: 'name' }, [r.name ?? '—']),
+        el('td', { class: 'mono', title: r.uuid }, [truncate(r.uuid, 34)]),
+        el('td', { class: 'mono' }, [r.tenant ?? '—']),
+        el('td', { class: 'mono' }, [r.cloud ?? '—']),
+        ...cells.get(r.uuid).map((v) => el('td', { class: 'mono' }, [renderCellVal(v)])),
+      ]);
+      tbody.append(tr);
+      if (st.openUuid === r.uuid) {
+        tbody.append(el('tr', { class: 'detail-row' }, [
+          el('td', { colspan: String(allCols.length) }, [detailPanel(r.uuid)]),
+        ]));
+      }
+    }
+    if (pageRows.length === 0) {
+      tbody.append(el('tr', {}, [el('td', { colspan: String(allCols.length), class: 'muted', style: 'padding:24px' },
+        ['No objects match' + (st.search ? ' “' + st.search + '”' : '') + '.'])]));
+    }
+
+    pane.append(el('div', { class: 'table-scroll' }, [el('table', {}, [el('thead', {}, [thead]), tbody])]));
+    pane.append(el('div', { class: 'pager' }, [
+      el('button', { class: 'btn', disabled: st.page === 0 ? '' : null, onclick: () => { st.page--; renderExplorerTable(pane); } }, ['‹ Prev']),
+      el('span', {}, ['Page ' + (st.page + 1) + ' / ' + pages]),
+      el('button', { class: 'btn', disabled: st.page + 1 >= pages ? '' : null, onclick: () => { st.page++; renderExplorerTable(pane); } }, ['Next ›']),
+    ]));
+  }
+
+  function detailPanel(uuid) {
+    const node = ds.graph.getNode(uuid);
+    const raw = ds.getRaw(uuid);
+    const outgoing = ds.graph.outgoingOf(uuid);
+    const incoming = ds.graph.incomingOf(uuid);
+
+    const edgeTarget = (uuidTo, label) => el('span', {
+      class: 'mono edge-target', role: 'link', tabindex: '0',
+      onclick: () => openObject(uuidTo),
+      onkeydown: (e) => { if (e.key === 'Enter') openObject(uuidTo); },
+    }, [label]);
+
+    const left = el('div', {}, [
+      el('div', { class: 'k', style: 'margin-bottom:6px' }, ['Outgoing references (' + outgoing.length + ')']),
+      ...outgoing.slice(0, 200).map((e) => el('div', { class: 'edge-line' }, [
+        el('span', { class: 'edge-field' }, [e.field]), ' → ',
+        e.to
+          ? edgeTarget(e.to, (ds.graph.getNode(e.to)?.name ?? e.refName ?? e.to))
+          : el('span', { class: 'edge-dangling' }, ['⚠ ' + (e.refName ?? 'unresolved') + ' (dangling)']),
+      ])),
+      outgoing.length > 200 ? el('div', { class: 'faint' }, ['… ' + (outgoing.length - 200) + ' more']) : '',
+      el('div', { class: 'k', style: 'margin:10px 0 6px' }, ['Referenced by (' + incoming.length + ')']),
+      ...incoming.slice(0, 200).map((e) => el('div', { class: 'edge-line' }, [
+        edgeTarget(e.from, (ds.graph.getNode(e.from)?.name ?? e.from)),
+        ' ', el('span', { class: 'edge-field' }, ['(' + e.field + ')']),
+      ])),
+      incoming.length > 200 ? el('div', { class: 'faint' }, ['… ' + (incoming.length - 200) + ' more']) : '',
+      el('div', { style: 'margin-top:10px' }, [
+        el('button', { class: 'btn', onclick: () => { relState.root = uuid; switchTo('relationships'); } }, ['View dependency graph']),
+      ]),
+    ]);
+    return el('div', { class: 'detail-grid' }, [left, jsonPre(raw, node)]);
+  }
+
+  /** Jump the explorer to one specific object and open its detail row. */
+  function openObject(uuid) {
+    const node = ds.graph.getNode(uuid);
+    if (!node) return;
+    explorerState.type = node.type;
+    explorerState.search = '';
+    explorerState.sort = 'name'; explorerState.dir = 'asc';
+    explorerState.openUuid = node.uuid;
+    const rows = ds.graph.allOfType(node.type).slice().sort((a, b) => cmpVals(a.name, b.name));
+    const idx = rows.findIndex((r) => r.uuid === node.uuid);
+    explorerState.page = idx >= 0 ? Math.floor(idx / 50) : 0;
+    switchTo('explorer');
+  }
+
+  function switchTo(v) {
+    view = v;
+    for (const t of $tabs.querySelectorAll('.tab')) t.setAttribute('aria-selected', String(t.dataset.view === v));
+    render();
+  }
+
+  // ---- relationships ----
+  const TYPE_COLORS = {
+    VirtualService: '#6366f1', VsVip: '#0ea5e9', Pool: '#10b981', PoolGroup: '#059669',
+    HealthMonitor: '#d97706', ServiceEngineGroup: '#8b5cf6', SSLKeyAndCertificate: '#ef4444',
+    ApplicationProfile: '#eab308', NetworkProfile: '#f97316', Tenant: '#64748b', Cloud: '#475569',
+  };
+  const typeColor = (t) => TYPE_COLORS[t] ?? '#7c8db0';
+
+  function relationshipsView() {
+    const st = relState;
+    const vsNodes = ds.graph.allOfType('VirtualService').slice().sort((a, b) => cmpVals(a.name, b.name));
+    if (st.root === null) st.root = vsNodes[0]?.uuid ?? null;
+    const rootNode = st.root ? ds.graph.getNode(st.root) : null;
+
+    const q = st.search.toLowerCase();
+    const filtered = q ? vsNodes.filter((n) => (n.name ?? n.uuid).toLowerCase().includes(q)) : vsNodes;
+
+    const searchInput = el('input', { type: 'search', placeholder: 'filter virtual services…', value: st.search, 'aria-label': 'Filter virtual services' });
+    let debounce = 0;
+    searchInput.addEventListener('input', () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => { st.search = searchInput.value; render(); }, 150);
+    });
+
+    const listPane = el('div', { class: 'card side-list' }, [
+      el('div', { class: 'k', style: 'margin-bottom:8px' }, ['Virtual services (' + fmt(vsNodes.length) + ')']),
+      searchInput,
+      ...(rootNode && rootNode.type !== 'VirtualService'
+        ? [el('div', { class: 'item sel' }, [el('span', {}, [(rootNode.name ?? rootNode.uuid) + ' (' + rootNode.type + ')'])])]
+        : []),
+      ...filtered.slice(0, 2000).map((n) => el('div', {
+        class: 'item' + (st.root === n.uuid ? ' sel' : ''),
+        onclick: () => { st.root = n.uuid; render(); },
+      }, [el('span', {}, [truncate(n.name ?? n.uuid, 26)])])),
+      filtered.length > 2000 ? el('div', { class: 'faint', style: 'padding:4px 8px' }, ['… ' + fmt(filtered.length - 2000) + ' more — narrow the filter']) : '',
+    ]);
+
+    const canvasPane = el('div', { class: 'card' });
+    if (!st.root) {
+      canvasPane.append(el('div', { class: 'muted' }, ['No VirtualService objects in this export. Open any object’s detail in the Explorer and use “View dependency graph”.']));
+    } else {
+      const dep = ds.graph.dependencyGraph(st.root);
+      if (!dep) canvasPane.append(el('div', { class: 'muted' }, ['Object not found.']));
+      else canvasPane.append(depGraphCanvas(dep));
+    }
+    return el('div', { class: 'split' }, [listPane, canvasPane]);
+  }
+
+  /** Static layered layout: BFS depth = column. Deterministic, no physics. */
+  function depGraphCanvas(dep) {
+    const wrap = el('div', {});
+    const present = new Map(dep.nodes.map((n) => [n.uuid, n]));
+    const links = dep.edges.filter((e) => e.to !== null && present.has(e.to) && present.has(e.from));
+
+    // Legend + summary.
+    const types = [...new Set(dep.nodes.map((n) => n.type))];
+    wrap.append(el('div', { class: 'rel-legend' }, [
+      el('span', { class: 'muted' }, [fmt(dep.nodes.length) + ' objects · ' + fmt(links.length) + ' references' + (dep.truncated ? ' · truncated at cap' : '')]),
+      ...types.map((t) => el('span', { class: 'chip' }, [
+        el('span', { class: 'dot', style: 'background:' + typeColor(t) }, []), t,
+      ])),
+    ]));
+
+    // Layout: group by depth, sort within column by (type, name).
+    const cols = [];
+    for (const n of dep.nodes) (cols[n.depth] ??= []).push(n);
+    for (const col of cols) if (col) col.sort((a, b) => cmpVals(a.type, b.type) || cmpVals(a.name, b.name));
+    const COL_W = 280, ROW_H = 24, PAD = 30;
+    const pos = new Map();
+    let maxRows = 1;
+    cols.forEach((col, d) => {
+      if (!col) return;
+      maxRows = Math.max(maxRows, col.length);
+      col.forEach((n, i) => pos.set(n.uuid, { x: PAD + d * COL_W, y: PAD + i * ROW_H }));
+    });
+    const worldW = PAD * 2 + Math.max(1, cols.length) * COL_W;
+    const worldH = PAD * 2 + maxRows * ROW_H;
+
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 ' + worldW + ' ' + worldH);
+    const edgeLayer = document.createElementNS(NS, 'g');
+    const nodeLayer = document.createElementNS(NS, 'g');
+    svg.append(edgeLayer, nodeLayer);
+
+    const tooltip = el('div', { class: 'tooltip', style: 'display:none' });
+    const canvas = el('div', { class: 'rel-canvas' }, [svg, tooltip]);
+    wrap.append(canvas);
+
+    // Edges.
+    const edgeEls = [];
+    for (const e of links) {
+      const a = pos.get(e.from), b = pos.get(e.to);
+      const p = document.createElementNS(NS, 'path');
+      const mx = (a.x + b.x) / 2;
+      p.setAttribute('d', 'M' + (a.x + 8) + ',' + a.y + ' C' + mx + ',' + a.y + ' ' + mx + ',' + b.y + ' ' + (b.x - 8) + ',' + b.y);
+      p.setAttribute('class', 'gedge');
+      edgeLayer.append(p);
+      edgeEls.push({ el: p, from: e.from, to: e.to, field: e.field });
+    }
+
+    // Nodes: dot + label.
+    const infoBox = el('div', { class: 'node-info' });
+    wrap.append(infoBox);
+    for (const n of dep.nodes) {
+      const { x, y } = pos.get(n.uuid);
+      const g = document.createElementNS(NS, 'g');
+      g.setAttribute('class', 'gnode');
+      g.setAttribute('transform', 'translate(' + x + ',' + y + ')');
+      const dot = document.createElementNS(NS, 'circle');
+      dot.setAttribute('r', n.depth === 0 ? '8' : '5.5');
+      dot.setAttribute('fill', typeColor(n.type));
+      const label = document.createElementNS(NS, 'text');
+      label.setAttribute('x', '12');
+      label.setAttribute('y', '4');
+      label.textContent = truncate(n.name ?? n.uuid, 30);
+      if (n.depth === 0) label.setAttribute('font-weight', '700');
+      g.append(dot, label);
+      nodeLayer.append(g);
+
+      g.addEventListener('mouseenter', (ev) => {
+        for (const ee of edgeEls) {
+          const touches = ee.from === n.uuid || ee.to === n.uuid;
+          ee.el.setAttribute('class', 'gedge' + (touches ? ' hl' : ' dim'));
+        }
+        tooltip.style.display = 'block';
+        tooltip.textContent = (n.name ?? n.uuid) + ' · ' + n.type + ' · depth ' + n.depth;
+      });
+      g.addEventListener('mousemove', (ev) => {
+        const r = canvas.getBoundingClientRect();
+        tooltip.style.left = Math.min(r.width - 200, ev.clientX - r.left + 12) + 'px';
+        tooltip.style.top = (ev.clientY - r.top + 12) + 'px';
+      });
+      g.addEventListener('mouseleave', () => {
+        for (const ee of edgeEls) ee.el.setAttribute('class', 'gedge');
+        tooltip.style.display = 'none';
+      });
+      g.addEventListener('click', () => {
+        infoBox.innerHTML = '';
+        infoBox.append(el('div', { class: 'card' }, [
+          el('b', {}, [n.name ?? n.uuid]), ' ', el('span', { class: 'muted' }, [n.type + ' · tenant ' + (n.tenant ?? '—')]),
+          ' ', el('button', { class: 'btn', style: 'margin-left:10px', onclick: () => openObject(n.uuid) }, ['Open in Explorer']),
+        ]));
+      });
+    }
+
+    // Pan / zoom on the viewBox — no per-frame simulation, just a transform.
+    let vb = { x: 0, y: 0, w: worldW, h: worldH };
+    const applyVb = () => svg.setAttribute('viewBox', vb.x + ' ' + vb.y + ' ' + vb.w + ' ' + vb.h);
+    svg.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const scale = e.deltaY > 0 ? 1.15 : 1 / 1.15;
+      const r = svg.getBoundingClientRect();
+      const px = vb.x + ((e.clientX - r.left) / r.width) * vb.w;
+      const py = vb.y + ((e.clientY - r.top) / r.height) * vb.h;
+      vb = { x: px - (px - vb.x) * scale, y: py - (py - vb.y) * scale, w: vb.w * scale, h: vb.h * scale };
+      applyVb();
+    }, { passive: false });
+    let panning = null;
+    svg.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('.gnode')) return;
+      panning = { x: e.clientX, y: e.clientY, vx: vb.x, vy: vb.y };
+      svg.classList.add('panning');
+      svg.setPointerCapture(e.pointerId);
+    });
+    svg.addEventListener('pointermove', (e) => {
+      if (!panning) return;
+      const r = svg.getBoundingClientRect();
+      vb.x = panning.vx - (e.clientX - panning.x) * (vb.w / r.width);
+      vb.y = panning.vy - (e.clientY - panning.y) * (vb.h / r.height);
+      applyVb();
+    });
+    svg.addEventListener('pointerup', () => { panning = null; svg.classList.remove('panning'); });
+    return wrap;
+  }
+
+  // ---- hygiene ----
+  function hygieneView() {
+    const report = ds.hygiene();
+    const st = hygState;
+    const wrap = el('div', {});
+
+    const sevStat = (sev, count) => el('div', {
+      class: 'stat clickable' + (st.severity === sev ? ' active' : ''),
+      role: 'button', tabindex: '0',
+      onclick: () => { st.severity = st.severity === sev ? 'all' : sev; st.page = 0; render(); },
+      onkeydown: (e) => { if (e.key === 'Enter') { st.severity = st.severity === sev ? 'all' : sev; st.page = 0; render(); } },
+    }, [
+      el('div', { class: 'k' }, [sev === 'all' ? 'total' : sev]),
+      el('div', { class: 'v' }, [fmt(count)]),
+    ]);
+    wrap.append(el('div', { class: 'stat-row' }, [
+      sevStat('critical', report.countsBySeverity.critical),
+      sevStat('warning', report.countsBySeverity.warning),
+      sevStat('info', report.countsBySeverity.info),
+      sevStat('all', report.total),
+    ]));
+
+    // Rule filter — every rule with its exact count.
+    const ruleSelect = el('select', { 'aria-label': 'Filter by rule' }, [
+      el('option', { value: 'all' }, ['All rules']),
+      ...report.rules.map((r) => el('option', { value: r.ruleId, selected: st.rule === r.ruleId ? '' : null },
+        [r.ruleId + ' (' + fmt(r.count) + ')'])),
+    ]);
+    ruleSelect.addEventListener('change', () => { st.rule = ruleSelect.value; st.page = 0; render(); });
+
+    let shownRules = report.rules;
+    if (st.severity !== 'all') shownRules = shownRules.filter((r) => r.severity === st.severity);
+    if (st.rule !== 'all') shownRules = shownRules.filter((r) => r.ruleId === st.rule);
+    const findings = shownRules.flatMap((r) => r.findings);
+    const capped = shownRules.filter((r) => r.count > r.findings.length);
+
+    const PAGE = 100;
+    const pages = Math.max(1, Math.ceil(findings.length / PAGE));
+    if (st.page >= pages) st.page = pages - 1;
+    const pageFindings = findings.slice(st.page * PAGE, st.page * PAGE + PAGE);
+
+    const card = el('div', { class: 'card' });
+    card.append(el('div', { class: 'toolbar' }, [
+      el('div', { style: 'max-width:340px; flex:1' }, [ruleSelect]),
+      el('span', { class: 'muted' }, [
+        capped.length > 0
+          ? 'showing the first ' + fmt(findings.length) + ' examples; counts above are exact'
+          : fmt(findings.length) + ' findings',
+      ]),
+    ]));
+
+    const tbody = el('tbody', {}, pageFindings.map((f) => el('tr', {}, [
+      el('td', {}, [el('span', { class: 'sev ' + f.severity }, [f.severity])]),
+      el('td', { class: 'mono' }, [f.ruleId]),
+      el('td', { class: 'name' }, [el('span', {
+        class: 'edge-target', role: 'link', tabindex: '0',
+        onclick: () => openObject(f.subject.uuid),
+        onkeydown: (e) => { if (e.key === 'Enter') openObject(f.subject.uuid); },
+      }, [f.subject.name ?? f.subject.uuid])]),
+      el('td', { class: 'mono' }, [f.subject.type]),
+      el('td', { style: 'white-space:normal; max-width:520px' }, [f.detail]),
+    ])));
+    if (pageFindings.length === 0) {
+      tbody.append(el('tr', {}, [el('td', { colspan: '5', class: 'muted', style: 'padding:20px' }, ['No findings for this filter.'])]));
+    }
+    card.append(el('div', { class: 'table-scroll' }, [el('table', {}, [
+      el('thead', {}, [el('tr', {}, ['Severity', 'Rule', 'Object', 'Type', 'Detail'].map((h) => el('th', { scope: 'col', style: 'cursor:default' }, [h])))]),
+      tbody,
+    ])]));
+    card.append(el('div', { class: 'pager' }, [
+      el('button', { class: 'btn', disabled: st.page === 0 ? '' : null, onclick: () => { st.page--; render(); } }, ['‹ Prev']),
+      el('span', {}, ['Page ' + (st.page + 1) + ' / ' + pages]),
+      el('button', { class: 'btn', disabled: st.page + 1 >= pages ? '' : null, onclick: () => { st.page++; render(); } }, ['Next ›']),
+    ]));
+    wrap.append(card);
+    return wrap;
+  }
+
+  // ---- charts (plain SVG) ----
+  function barsSvg(buckets) {
+    const shown = buckets.slice(0, 12);
+    const overflow = buckets.length - shown.length;
+    const max = Math.max(1, ...shown.map((b) => b.count));
+    const ROW = 22, LABEL_W = 120, W = 320;
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    const H = shown.length * ROW + (overflow > 0 ? 18 : 0);
+    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    svg.setAttribute('style', 'width:100%; height:auto');
+    shown.forEach((b, i) => {
+      const y = i * ROW;
+      const t = document.createElementNS(NS, 'text');
+      t.setAttribute('x', '0'); t.setAttribute('y', String(y + 14)); t.setAttribute('class', 'bar-label');
+      t.textContent = truncate(b.key, 16);
+      const title = document.createElementNS(NS, 'title');
+      title.textContent = b.key + ': ' + fmt(b.count);
+      t.append(title);
+      const rect = document.createElementNS(NS, 'rect');
+      const w = Math.max(2, (b.count / max) * (W - LABEL_W - 56));
+      rect.setAttribute('x', String(LABEL_W)); rect.setAttribute('y', String(y + 4));
+      rect.setAttribute('width', String(w)); rect.setAttribute('height', '14');
+      rect.setAttribute('rx', '2'); rect.setAttribute('class', 'bar-rect');
+      const c = document.createElementNS(NS, 'text');
+      c.setAttribute('x', String(LABEL_W + w + 6)); c.setAttribute('y', String(y + 14)); c.setAttribute('class', 'bar-count');
+      c.textContent = fmt(b.count);
+      svg.append(t, rect, c);
+    });
+    if (overflow > 0) {
+      const t = document.createElementNS(NS, 'text');
+      t.setAttribute('x', '0'); t.setAttribute('y', String(shown.length * ROW + 12));
+      t.setAttribute('class', 'bar-count');
+      t.textContent = '… and ' + overflow + ' more';
+      svg.append(t);
+    }
+    return svg;
+  }
+
+  /** Slice-and-dice treemap — proportional areas without a physics or layout lib. */
+  function treemapSvg(buckets, onPick) {
+    const W = 660, H = 300;
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    svg.setAttribute('style', 'width:100%; height:auto');
+    const items = buckets.filter((b) => b.count > 0);
+    const total = items.reduce((s, b) => s + b.count, 0);
+    if (total === 0) return svg;
+
+    // Recursive slice-and-dice: split the largest-remaining group off the long side.
+    const place = (list, x, y, w, h, horiz) => {
+      if (list.length === 0 || w < 1 || h < 1) return;
+      if (list.length === 1) { draw(list[0], x, y, w, h); return; }
+      const sum = list.reduce((s, b) => s + b.count, 0);
+      let acc = 0, cut = 1;
+      for (; cut < list.length; cut++) {
+        acc += list[cut - 1].count;
+        if (acc >= sum / 2) break;
+      }
+      const frac = acc / sum;
+      if (horiz) {
+        place(list.slice(0, cut), x, y, w * frac, h, w * frac < h);
+        place(list.slice(cut), x + w * frac, y, w * (1 - frac), h, w * (1 - frac) < h);
+      } else {
+        place(list.slice(0, cut), x, y, w, h * frac, w < h * frac);
+        place(list.slice(cut), x, y + h * frac, w, h * (1 - frac), w < h * (1 - frac));
+      }
+    };
+    const PALETTE = ['#6366f1', '#0ea5e9', '#10b981', '#d97706', '#8b5cf6', '#ef4444', '#0d9488', '#f97316', '#64748b', '#a855f7', '#059669', '#e11d48'];
+    let ci = 0;
+    const colorOf = new Map();
+    const draw = (b, x, y, w, h) => {
+      if (!colorOf.has(b.key)) colorOf.set(b.key, TYPE_COLORS[b.key] ?? PALETTE[ci++ % PALETTE.length]);
+      const g = document.createElementNS(NS, 'g');
+      const rect = document.createElementNS(NS, 'rect');
+      rect.setAttribute('x', String(x)); rect.setAttribute('y', String(y));
+      rect.setAttribute('width', String(Math.max(0, w))); rect.setAttribute('height', String(Math.max(0, h)));
+      rect.setAttribute('fill', colorOf.get(b.key));
+      rect.setAttribute('class', 'tm-rect');
+      rect.setAttribute('role', 'button');
+      rect.setAttribute('tabindex', '0');
+      rect.setAttribute('aria-label', b.key + ', ' + fmt(b.count) + ' objects. Open in Explorer.');
+      const title = document.createElementNS(NS, 'title');
+      title.textContent = b.key + ': ' + fmt(b.count) + ' — click to explore';
+      rect.append(title);
+      rect.addEventListener('click', () => onPick(b.key));
+      rect.addEventListener('keydown', (e) => { if (e.key === 'Enter') onPick(b.key); });
+      g.append(rect);
+      if (w > 70 && h > 26) {
+        const t = document.createElementNS(NS, 'text');
+        t.setAttribute('x', String(x + 6)); t.setAttribute('y', String(y + 16));
+        t.setAttribute('class', 'tm-label');
+        // AA contrast: dark text on light fills, white on dark fills.
+        t.setAttribute('fill', yiq(colorOf.get(b.key)) > 150 ? '#16202e' : '#ffffff');
+        t.textContent = truncate(b.key, Math.floor(w / 7)) + ' (' + fmt(b.count) + ')';
+        g.append(t);
+      }
+      svg.append(g);
+    };
+    place(items, 0, 0, W, H, W >= H);
+    return svg;
+  }
+
+  // ---- JSON display ----
+  function jsonPre(raw, node) {
+    let text;
+    try { text = JSON.stringify(JSON.parse(raw), null, 2); }
+    catch { text = raw ?? ''; }
+    const pre = el('pre', { class: 'json' });
+    // Highlighting is a regex pass over the whole string; skip it past 2 MB
+    // so one pathological object cannot stall the tab.
+    if (text.length > 2_000_000) pre.textContent = text;
+    else pre.innerHTML = highlight(text);
+    return el('div', {}, [
+      el('div', { class: 'k', style: 'margin-bottom:6px' }, ['Source object' + (node ? ' — ' + node.type : '')]),
+      pre,
+    ]);
+  }
+
+  function esc(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  function highlight(jsonText) {
+    const json = esc(jsonText);
+    const re = /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false)\b|\bnull\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g;
+    return json.replace(re, (match) => {
+      let cls = 'tok-num';
+      if (match[0] === '"') cls = /:$/.test(match) ? 'tok-key' : 'tok-str';
+      else if (match === 'true' || match === 'false') cls = 'tok-bool';
+      else if (match === 'null') cls = 'tok-null';
+      return '<span class="' + cls + '">' + match + '</span>';
+    });
+  }
+
+  // ---- tiny DOM + formatting helpers ----
+  function el(tag, attrs = {}, children = []) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (v === null || v === undefined) continue;
+      if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
+      else if (k === 'disabled' || k === 'selected' || k === 'hidden') { if (v !== false) node.setAttribute(k, ''); }
+      else node.setAttribute(k, String(v));
+    }
+    for (const c of children) {
+      if (c === '' || c === null || c === undefined) continue;
+      node.append(typeof c === 'string' ? document.createTextNode(c) : c);
+    }
+    return node;
+  }
+  function renderCellVal(v) {
+    if (v == null) return el('span', { class: 'faint' }, ['—']);
+    if (v === 'true') return el('span', { class: 'bool-t' }, ['true']);
+    if (v === 'false') return el('span', { class: 'bool-f' }, ['false']);
+    return truncate(v, 40);
+  }
+  function cmpVals(a, b) {
+    if (a == null && b == null) return 0;
+    if (a == null) return 1; // nulls last
+    if (b == null) return -1;
+    const na = Number(a), nb = Number(b);
+    if (!Number.isNaN(na) && !Number.isNaN(nb) && a !== '' && b !== '') return na - nb;
+    return String(a).localeCompare(String(b));
+  }
+  function truncate(s, n) {
+    s = String(s);
+    return s.length > n ? s.slice(0, n - 1) + '…' : s;
+  }
+  function fmt(n) { return Number(n).toLocaleString(); }
+  function fmtMB(n) { return (n / 1e6).toFixed(1) + ' MB'; }
+  /** Perceived brightness (0-255) of a #rrggbb color. */
+  function yiq(hex) {
+    const n = parseInt(hex.slice(1), 16);
+    return ((n >> 16 & 255) * 299 + (n >> 8 & 255) * 587 + (n & 255) * 114) / 1000;
+  }
+
+  render();
+}
+</script>
+</body>
+</html>

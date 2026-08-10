@@ -1,31 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseRef, uuidVariants } from '@avi/shared';
-import { RefGraph } from './ref-graph.js';
+import { app } from '../extract-app.mjs';
 
-test('parseRef extracts type, uuid, and fragment name', () => {
-  const r = parseRef('https://10.0.0.1/api/pool/pool-84cf-e6b#web-pool');
-  assert.equal(r?.objectType, 'pool');
-  assert.equal(r?.uuid, 'pool-84cf-e6b');
-  assert.equal(r?.name, 'web-pool');
-});
-
-test('parseRef reads ?name=&tenant=&cloud= query params', () => {
-  const r = parseRef('https://c/api/vsvip/vsvip-1?name=my-vip&tenant=admin&cloud=Default-Cloud');
-  assert.equal(r?.name, 'my-vip');
-  assert.equal(r?.tenant, 'admin');
-  assert.equal(r?.cloud, 'Default-Cloud');
-});
-
-test('parseRef tolerates bare names', () => {
-  assert.equal(parseRef('admin')?.name, 'admin');
-  assert.equal(parseRef(''), null);
-  assert.equal(parseRef(42 as unknown), null);
-});
-
-test('uuidVariants strips the type prefix', () => {
-  assert.deepEqual(uuidVariants('pool-84cf-e6b'), ['pool-84cf-e6b', '84cf-e6b']);
-});
+const { RefGraph } = app;
 
 test('graph resolves VS -> pool by uuid', () => {
   const g = new RefGraph();
@@ -46,7 +23,6 @@ test('graph resolves VS -> pool by uuid', () => {
 
 test('graph falls back to type+name when uuid does not match', () => {
   const g = new RefGraph();
-  // ref points at a bare uuid the target does not carry, but names match.
   g.addObject('VirtualService', {
     name: 'vs2', uuid: 'virtualservice-2',
     pool_ref: 'https://c/api/pool/pool-DIFFERENT#web-pool',
@@ -102,8 +78,26 @@ test('dependency graph walks VS -> vsvip/pool chain with depth', () => {
 
   const dep = g.dependencyGraph('virtualservice-9');
   assert.ok(dep);
-  const uuids = dep!.nodes.map((n) => n.uuid).sort();
+  const uuids = dep.nodes.map((n) => n.uuid).sort();
   assert.deepEqual(uuids, ['healthmonitor-9', 'pool-9', 'virtualservice-9', 'vsvip-9']);
-  const hm = dep!.nodes.find((n) => n.uuid === 'healthmonitor-9');
+  const hm = dep.nodes.find((n) => n.uuid === 'healthmonitor-9');
   assert.equal(hm?.depth, 2);
+});
+
+test('objects without name or uuid are not indexed', () => {
+  const g = new RefGraph();
+  assert.equal(g.addObject('Pool', { lb_algorithm: 'x' }), null);
+  assert.equal(g.addObject('Pool', 42), null);
+  assert.equal(g.size, 0);
+});
+
+test('types() reports per-type counts, largest first', () => {
+  const g = new RefGraph();
+  g.addObject('Pool', { name: 'a', uuid: 'pool-a' });
+  g.addObject('Pool', { name: 'b', uuid: 'pool-b' });
+  g.addObject('VirtualService', { name: 'v', uuid: 'virtualservice-v' });
+  assert.deepEqual(g.types(), [
+    { key: 'Pool', count: 2 },
+    { key: 'VirtualService', count: 1 },
+  ]);
 });

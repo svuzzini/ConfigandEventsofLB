@@ -1,25 +1,13 @@
 {
   "name": "avi-config-analyzer",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "Ingest an Avi (NSX ALB) controller config export and explore it as a queryable object graph.",
-  "workspaces": [
-    "packages/shared",
-    "packages/server",
-    "packages/web"
-  ],
+  "description": "Single-file, client-side analyzer for Avi (NSX ALB) controller config exports. The app is avi-analyzer.html; this package.json exists only to run the tests.",
+  "type": "module",
   "scripts": {
-    "build": "npm run build -w @avi/shared && npm run build -w @avi/server && npm run build -w @avi/web",
-    "build:shared": "npm run build -w @avi/shared",
-    "dev:server": "npm run dev -w @avi/server",
-    "dev:web": "npm run dev -w @avi/web",
-    "test": "npm run test -w @avi/server",
-    "typecheck": "tsc -b --pretty"
+    "test": "node --test tools/tests/*.test.mjs"
   },
   "engines": {
-    "node": ">=22"
-  },
-  "devDependencies": {
-    "typescript": "^5.5.0"
+    "node": ">=20"
   }
 }

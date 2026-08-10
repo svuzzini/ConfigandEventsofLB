@@ -1,11 +1,3 @@
 node_modules/
-dist/
-*.tsbuildinfo
-packages/*/dist/
-packages/server/data/
-*.duckdb
-*.duckdb.wal
-*.sqlite
-*.sqlite-*
 .DS_Store
 *.log
