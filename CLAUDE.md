@@ -52,7 +52,18 @@ in Node — keep new UI code inside `boot()`.
 - **hygiene** — pure rules over (dataset, graph). Counts are always exact; at
   most `MAX_EXEMPLARS` (500) findings kept per rule — never render or retain
   unbounded findings. New rules follow the `add(ruleId, severity, ...)` pattern.
-- **ui** — vanilla DOM in `boot()`. Four views; every list is paginated; only
+- **search** — `SearchIndex`: an inverted token index (token → doc ids)
+  built ONCE per dataset, lazily on first search (`Dataset.searchIndex()`
+  caches the build promise; a superseded keystroke never restarts it).
+  Queries scan only the vocabulary, never the corpus — do not regress to
+  per-keystroke slice scans. `searchDataset`: terms split on any char
+  outside `[a-z0-9._-]` (so `ip:port` ≡ `ip port`), AND-ed,
+  substring-of-token matched, never regex-compiled. Exact `total` and
+  `byType` facet counts always; at most `MAX_SEARCH_RESULTS` (500)
+  retained (name matches prioritized), scored/snippeted only within that
+  bound. `searchSnippets` extracts context via a nearest-preceding-key
+  heuristic that degrades to null.
+- **ui** — vanilla DOM in `boot()`. Five views; every list is paginated; only
   the visible page's objects are ever parsed for display. Charts are plain SVG
   (bars, slice-and-dice treemap, layered BFS dependency graph — deterministic,
   no physics). Keep light/dark via `prefers-color-scheme` and WCAG AA contrast.

@@ -19,8 +19,12 @@
     graph    — lightweight node + resolved edge index (uuid-first, name fallback)
     dataset  — in-memory store: raw text slice per object, parsed on demand
     hygiene  — pure rules over (dataset, graph); exact counts, capped exemplars
-    ui       — vanilla DOM; four views: Inventory / Explorer / Relationships /
-               Hygiene. No framework, no build step, no dependencies.
+    search   — inverted token index built once from the raw slices; queries
+               scan only the vocabulary. Multi-term AND, exact totals, type
+               facets, capped ranked results, field-aware snippets
+    ui       — vanilla DOM; five views: Inventory / Explorer / Search /
+               Relationships / Hygiene. No framework, no build step, no
+               dependencies.
 
   Tests: tools/run under `node --test tools/tests/` — the harness extracts this
   file's module (marked id="app") and imports it; keep the exports stable.
@@ -191,6 +195,27 @@
   .tok-key { color: var(--tok-key); } .tok-str { color: var(--tok-str); }
   .tok-num { color: var(--tok-num); } .tok-bool { color: var(--tok-bool); } .tok-null { color: var(--tok-null); }
 
+  /* ---- global search ---- */
+  .search-head { max-width: 720px; margin: 4px auto 16px; }
+  .search-head input { font-size: 15px; padding: 10px 16px; border-radius: 22px; }
+  .search-hint { text-align: center; }
+  .search-status { max-width: 860px; margin: 0 auto 10px; }
+  .result { max-width: 860px; margin: 0 auto 10px; }
+  .result-title { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 4px; }
+  .result-title .edge-target { font-weight: 600; font-size: 14px; }
+  .result-type { background: var(--accent-bg); color: var(--accent-ink); border-radius: 10px; padding: 1px 8px; font-size: 11px; }
+  .snippet { color: var(--muted); white-space: normal; overflow-wrap: anywhere; margin-bottom: 2px; }
+  mark.hl { background: var(--warn-bg); color: var(--ink); font-weight: 650; padding: 0 1px; border-radius: 2px; }
+  .facets { display: flex; gap: 6px; flex-wrap: wrap; max-width: 860px; margin: 0 auto 10px; }
+  .facet {
+    border: 1px solid var(--line); background: var(--panel); border-radius: 14px;
+    padding: 2px 10px; cursor: pointer; font-size: 12px; color: var(--muted);
+  }
+  .facet:hover { border-color: var(--accent); color: var(--accent-ink); }
+  .facet.active { background: var(--accent-bg); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  .assoc { margin-top: 4px; font-size: 12px; }
+  .assoc .k2 { color: var(--faint); text-transform: uppercase; font-size: 10px; letter-spacing: .05em; margin-right: 4px; }
+
   /* ---- severity ---- */
   .sev { padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
   .sev.critical { background: var(--err-bg); color: var(--err); }
@@ -226,6 +251,7 @@
     <div class="tabs" role="tablist" id="tabs" hidden>
       <button class="tab" role="tab" data-view="inventory" aria-selected="true">Inventory</button>
       <button class="tab" role="tab" data-view="explorer" aria-selected="false">Explorer</button>
+      <button class="tab" role="tab" data-view="search" aria-selected="false">Search</button>
       <button class="tab" role="tab" data-view="relationships" aria-selected="false">Relationships</button>
       <button class="tab" role="tab" data-view="hygiene" aria-selected="false">Hygiene</button>
     </div>
@@ -795,6 +821,7 @@ export class Dataset {
     this._colValues = new Map();   // type\0col -> Map(uuid -> string|null)
     this._inventory = null;
     this._hygiene = null;
+    this._searchIndexPromise = null;
   }
 
   /** Parse a raw slice on demand. Returns {} for unknown uuids. */
@@ -858,6 +885,17 @@ export class Dataset {
   hygiene() {
     if (!this._hygiene) this._hygiene = runHygiene(this);
     return this._hygiene;
+  }
+
+  /**
+   * Lazily built inverted search index, shared by every search over this
+   * dataset. The build is deliberately NOT cancellable by an individual
+   * search: it is a one-time O(config) investment, and cancelling it on
+   * every superseded keystroke would restart it from scratch each time.
+   */
+  searchIndex(opts) {
+    if (!this._searchIndexPromise) this._searchIndexPromise = buildSearchIndex(this, opts);
+    return this._searchIndexPromise;
   }
 
   /** Version string from META, when present. */
@@ -993,6 +1031,241 @@ function extractNotAfter(o) {
 }
 
 // ======================================================================
+// search — Google-style search over every object, backed by an inverted
+// token index.
+//
+// Why an index: the naive approach (lowercase + substring-scan every raw
+// slice per keystroke) is O(total config bytes) per query — seconds on a
+// large export. Instead each raw slice is tokenized ONCE into an inverted
+// index (token -> object ids). A query then scans only the vocabulary
+// (deduped tokens, capped at MAX_TOKEN_LENGTH chars — orders of magnitude
+// smaller than the corpus) and unions/intersects posting lists.
+//
+// Query semantics (deliberately forgiving):
+//  - case-insensitive, literal — user input is never regex-compiled;
+//  - the query splits into terms on any character outside [a-z0-9._-], so
+//    "10.0.1.11:8080", '"addr": 10.0.1.11' and "10.0.1.11 8080" all mean
+//    the same thing;
+//  - terms are AND-ed: every term must appear somewhere in the object;
+//  - a term matches as a substring of any token ("0.1.11" finds
+//    "10.0.1.11"), and the object *type* name is indexed too.
+//
+// Exact totals and per-type facet counts always; at most
+// MAX_SEARCH_RESULTS results retained (name matches prioritized), scored
+// and snippeted only within that bounded set — the hygiene
+// exact-count/capped-exemplars contract.
+// ======================================================================
+
+export const MAX_SEARCH_RESULTS = 500;
+export const MIN_SEARCH_LENGTH = 2;
+const MAX_SNIPPETS = 3;
+const SNIPPET_CONTEXT = 44;
+const FIELD_LOOKBACK = 220;
+const MAX_COUNT_PER_OBJECT = 1000;
+const MAX_TOKEN_LENGTH = 64;
+const TOKEN_RE = /[a-z0-9][a-z0-9._-]*/g;
+
+/** Split free-form user input into normalized AND-terms. */
+export function tokenizeQuery(query) {
+  return String(query).toLowerCase().match(TOKEN_RE) ?? [];
+}
+
+export class SearchIndex {
+  constructor() {
+    this.uuids = [];           // doc id -> canonical uuid
+    this.postings = new Map(); // token -> doc id[] (ascending by construction)
+    this.tokens = [];          // vocabulary snapshot, filled by finalize()
+  }
+
+  addDocument(uuid, tokenSet) {
+    const id = this.uuids.length;
+    this.uuids.push(uuid);
+    for (const t of tokenSet) {
+      const list = this.postings.get(t);
+      if (list) list.push(id); else this.postings.set(t, [id]);
+    }
+  }
+
+  finalize() { this.tokens = [...this.postings.keys()]; }
+
+  /**
+   * Doc ids of every object containing `term` as a substring of any token.
+   * Scans the vocabulary, never the corpus; chunked + yielding.
+   */
+  async lookup(term, { isCancelled } = {}) {
+    const out = new Set();
+    for (let i = 0; i < this.tokens.length; i++) {
+      if (i % 100_000 === 99_999) {
+        await new Promise((r) => setTimeout(r, 0));
+        if (isCancelled && isCancelled()) return null;
+      }
+      const tok = this.tokens[i];
+      if (tok.includes(term)) for (const id of this.postings.get(tok)) out.add(id);
+    }
+    return out;
+  }
+}
+
+/** Tokenize every raw slice once. Chunked + yielding; reports progress. */
+export async function buildSearchIndex(ds, { onProgress } = {}) {
+  const idx = new SearchIndex();
+  const total = ds.raws.size;
+  let i = 0;
+  for (const [uuid, slice] of ds.raws) {
+    if (i++ % 500 === 499) {
+      await new Promise((r) => setTimeout(r, 0));
+      if (onProgress) onProgress(i, total);
+    }
+    const node = ds.graph.getNode(uuid);
+    if (!node) continue;
+    const tokens = new Set();
+    for (const t of slice.toLowerCase().match(TOKEN_RE) ?? []) {
+      if (t.length <= MAX_TOKEN_LENGTH) tokens.add(t);
+    }
+    for (const t of node.type.toLowerCase().match(TOKEN_RE) ?? []) tokens.add(t);
+    idx.addDocument(uuid, tokens);
+  }
+  idx.finalize();
+  return idx;
+}
+
+function countMatches(hay, q, cap = MAX_COUNT_PER_OBJECT) {
+  let n = 0, idx = hay.indexOf(q);
+  while (idx !== -1 && n < cap) { n++; idx = hay.indexOf(q, idx + q.length); }
+  return n;
+}
+
+function intersect(a, b) {
+  const [small, big] = a.size <= b.size ? [a, b] : [b, a];
+  const out = new Set();
+  for (const v of small) if (big.has(v)) out.add(v);
+  return out;
+}
+
+function countTermHits(name, terms) {
+  const n = (name ?? '').toLowerCase();
+  if (n === '') return 0;
+  let hits = 0;
+  for (const t of terms) if (n.includes(t)) hits++;
+  return hits;
+}
+
+/**
+ * Context snippets for `query` inside a raw JSON slice: up to `max` entries
+ * of {field, before, match, after}. `field` is the nearest JSON key preceding
+ * the match — a bounded regex lookback, not a parse; it degrades to null on
+ * anything odd rather than throwing. `match` preserves the slice's original
+ * casing.
+ */
+export function searchSnippets(raw, query, max = MAX_SNIPPETS) {
+  const q = String(query).toLowerCase();
+  if (q === '') return [];
+  const hay = raw.toLowerCase();
+  const out = [];
+  let idx = hay.indexOf(q);
+  while (idx !== -1 && out.length < max) {
+    let field = null;
+    const back = raw.slice(Math.max(0, idx - FIELD_LOOKBACK), idx);
+    const keyRe = /"([^"\\]{1,64})"\s*:/g;
+    let m;
+    while ((m = keyRe.exec(back)) !== null) field = m[1];
+    const start = Math.max(0, idx - SNIPPET_CONTEXT);
+    const end = Math.min(raw.length, idx + q.length + SNIPPET_CONTEXT);
+    out.push({
+      field,
+      before: (start > 0 ? '…' : '') + raw.slice(start, idx).replace(/\s+/g, ' '),
+      match: raw.slice(idx, idx + q.length),
+      after: raw.slice(idx + q.length, end).replace(/\s+/g, ' ') + (end < raw.length ? '…' : ''),
+    });
+    idx = hay.indexOf(q, idx + q.length);
+  }
+  return out;
+}
+
+/** Up to MAX_SNIPPETS snippets, spread across the query's terms. */
+function resultSnippets(raw, terms) {
+  const per = Math.max(1, Math.floor(MAX_SNIPPETS / terms.length));
+  const out = [];
+  for (const t of terms) {
+    for (const s of searchSnippets(raw, t, per)) {
+      if (out.length >= MAX_SNIPPETS) return out;
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/**
+ * Search every object via the inverted index. Terms are AND-ed; an
+ * optional `typeFilter` narrows results to one object type while `byType`
+ * facet counts always describe the unfiltered candidate set. `total` is
+ * exact; scoring and snippets are computed only for the retained (≤ limit)
+ * results. `isCancelled` is checked at every yield point after the index
+ * build (the build itself is shared and never restarted — see
+ * Dataset.searchIndex).
+ */
+export async function searchDataset(ds, query, { limit = MAX_SEARCH_RESULTS, isCancelled, typeFilter = 'all', onProgress } = {}) {
+  const trimmed = String(query).trim();
+  const result = { query: trimmed, total: 0, results: [], byType: [], truncated: false, cancelled: false };
+  if (trimmed.length < MIN_SEARCH_LENGTH) return result;
+  const terms = tokenizeQuery(trimmed);
+  if (terms.length === 0) return result;
+
+  const index = await ds.searchIndex({ onProgress });
+  if (isCancelled && isCancelled()) { result.cancelled = true; return result; }
+
+  // AND the per-term candidate sets; early exit once empty.
+  let candidates = null;
+  for (const term of terms) {
+    const ids = await index.lookup(term, { isCancelled });
+    if (ids === null) { result.cancelled = true; return result; }
+    candidates = candidates === null ? ids : intersect(candidates, ids);
+    if (candidates.size === 0) break;
+  }
+
+  // One pass over candidates: facet counts (pre-filter), the filtered exact
+  // total, and bounded retention with name matches prioritized.
+  const byType = new Map();
+  const named = [], rest = [];
+  let i = 0;
+  for (const id of candidates) {
+    if (i++ % 5000 === 4999) {
+      await new Promise((r) => setTimeout(r, 0));
+      if (isCancelled && isCancelled()) { result.cancelled = true; return result; }
+    }
+    const node = ds.graph.getNode(index.uuids[id]);
+    if (!node) continue;
+    byType.set(node.type, (byType.get(node.type) ?? 0) + 1);
+    if (typeFilter !== 'all' && node.type !== typeFilter) continue;
+    result.total++;
+    const nameHits = countTermHits(node.name, terms);
+    if (nameHits > 0) { if (named.length < limit) named.push({ node, nameHits }); }
+    else if (rest.length < limit) rest.push({ node, nameHits: 0 });
+  }
+  result.byType = [...byType.entries()].map(([key, count]) => ({ key, count }))
+    .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
+
+  // Score + snippet only the retained results (bounded by `limit`).
+  for (const r of named.concat(rest).slice(0, limit)) {
+    const raw = ds.getRaw(r.node.uuid) ?? '';
+    const low = raw.toLowerCase();
+    let count = 0;
+    for (const t of terms) count += countMatches(low, t);
+    const typeHit = terms.some((t) => r.node.type.toLowerCase().includes(t));
+    result.results.push({
+      node: r.node,
+      count,
+      score: r.nameHits * 1_000_000 + count * 10 + (typeHit ? 1 : 0),
+      snippets: count > 0 ? resultSnippets(raw, terms) : [],
+    });
+  }
+  result.results.sort((a, b) => b.score - a.score
+    || String(a.node.name ?? a.node.uuid).localeCompare(String(b.node.name ?? b.node.uuid)));
+  result.truncated = result.total > result.results.length;
+  return result;
+}
+
+// ======================================================================
 // ui — everything below touches the DOM and only runs in a browser.
 // ======================================================================
 
@@ -1011,6 +1284,7 @@ function boot() {
   const explorerState = { type: null, search: '', sort: 'name', dir: 'asc', page: 0, openUuid: null };
   const relState = { root: null, search: '' };
   const hygState = { severity: 'all', rule: 'all', page: 0 };
+  const searchState = { query: '', page: 0, result: null, token: 0, typeFilter: 'all' };
 
   // ---- shell wiring ----
   $tabs.addEventListener('click', (e) => {
@@ -1021,6 +1295,15 @@ function boot() {
     render();
   });
   $btnNew.addEventListener('click', () => { ds = null; renderShell(); render(); });
+
+  // "/" from anywhere jumps to search (unless already typing somewhere).
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== '/' || !ds || e.metaKey || e.ctrlKey || e.altKey) return;
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+    e.preventDefault();
+    switchTo('search');
+  });
 
   function renderShell() {
     $tabs.hidden = !ds;
@@ -1043,6 +1326,7 @@ function boot() {
     if (!ds) { $main.append(uploadView()); return; }
     if (view === 'inventory') $main.append(inventoryView());
     else if (view === 'explorer') $main.append(explorerView());
+    else if (view === 'search') $main.append(searchView());
     else if (view === 'relationships') $main.append(relationshipsView());
     else if (view === 'hygiene') $main.append(hygieneView());
   }
@@ -1101,6 +1385,7 @@ function boot() {
       explorerState.type = null; explorerState.page = 0; explorerState.openUuid = null; explorerState.search = '';
       relState.root = null; relState.search = '';
       hygState.severity = 'all'; hygState.rule = 'all'; hygState.page = 0;
+      searchState.query = ''; searchState.page = 0; searchState.result = null; searchState.token++; searchState.typeFilter = 'all';
       view = 'inventory';
       for (const t of $tabs.querySelectorAll('.tab')) t.setAttribute('aria-selected', String(t.dataset.view === 'inventory'));
       renderShell();
@@ -1330,6 +1615,161 @@ function boot() {
     view = v;
     for (const t of $tabs.querySelectorAll('.tab')) t.setAttribute('aria-selected', String(t.dataset.view === v));
     render();
+  }
+
+  // ---- global search ----
+  function searchView() {
+    const st = searchState;
+    const input = el('input', {
+      type: 'search', value: st.query,
+      placeholder: 'Search anything — combine words to narrow: 10.0.1.11 8080',
+      'aria-label': 'Search all objects',
+    });
+    const resultsBox = el('div', {});
+    let debounce = 0;
+    const commit = () => {
+      st.query = input.value; st.page = 0; st.typeFilter = 'all';
+      runSearch(resultsBox);
+    };
+    input.addEventListener('input', () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(commit, 250);
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { clearTimeout(debounce); commit(); }
+    });
+    const wrap = el('div', {}, [el('div', { class: 'search-head' }, [input]), resultsBox]);
+
+    const trimmed = st.query.trim();
+    if (trimmed.length >= MIN_SEARCH_LENGTH && (!st.result || st.result.query !== trimmed)) runSearch(resultsBox);
+    else renderSearchResults(resultsBox);
+    setTimeout(() => { if (input.isConnected) input.focus(); }, 0);
+    return wrap;
+  }
+
+  async function runSearch(box) {
+    const st = searchState;
+    const token = ++st.token;
+    const q = st.query.trim();
+    if (q.length < MIN_SEARCH_LENGTH) { st.result = null; renderSearchResults(box); return; }
+    const status = el('div', { class: 'muted search-hint', role: 'status' }, ['Searching…']);
+    box.innerHTML = '';
+    box.append(status);
+    const res = await searchDataset(ds, q, {
+      typeFilter: st.typeFilter,
+      isCancelled: () => st.token !== token || !box.isConnected,
+      onProgress: (done, total) => {
+        status.textContent = 'Indexing ' + fmt(total) + ' objects — '
+          + Math.round((done / Math.max(1, total)) * 100) + '% (one-time; every later search is instant)';
+      },
+    });
+    if (st.token !== token || res.cancelled) return;
+    st.result = res;
+    st.page = 0;
+    renderSearchResults(box);
+  }
+
+  /** Clickable "Used by" / "References" links so associations are one hop away. */
+  function assocLine(label, uuids) {
+    const uniq = [...new Set(uuids)];
+    if (uniq.length === 0) return '';
+    const children = [el('span', { class: 'k2' }, [label])];
+    uniq.slice(0, 3).forEach((u, i) => {
+      const n = ds.graph.getNode(u);
+      if (i > 0) children.push(', ');
+      children.push(el('span', {
+        class: 'edge-target', role: 'link', tabindex: '0',
+        onclick: () => openObject(u),
+        onkeydown: (e) => { if (e.key === 'Enter') openObject(u); },
+      }, [(n?.name ?? u) + (n ? ' (' + n.type + ')' : '')]));
+    });
+    if (uniq.length > 3) children.push(el('span', { class: 'faint' }, [' +' + fmt(uniq.length - 3) + ' more']));
+    return el('div', { class: 'assoc' }, children);
+  }
+
+  function renderSearchResults(box) {
+    const st = searchState;
+    box.innerHTML = '';
+    if (st.query.trim().length < MIN_SEARCH_LENGTH) {
+      box.append(el('div', { class: 'muted search-hint' }, [
+        'Every object’s full JSON is searched — an IP, a port, a name, a uuid fragment. '
+        + 'Combine words to narrow down: “10.0.1.11 8080” finds objects containing both. '
+        + 'Press / from any tab to jump here.',
+      ]));
+      return;
+    }
+    const res = st.result;
+    if (!res || res.query !== st.query.trim()) return; // search in flight
+
+    // Type facets — always shown from the unfiltered candidate set.
+    const facetTotal = res.byType.reduce((s, b) => s + b.count, 0);
+    if (facetTotal > 0 && (res.byType.length > 1 || st.typeFilter !== 'all')) {
+      const chip = (label, key, count) => el('button', {
+        class: 'facet' + (st.typeFilter === key ? ' active' : ''),
+        onclick: () => { st.typeFilter = key; st.page = 0; runSearch(box); },
+      }, [label + ' (' + fmt(count) + ')']);
+      box.append(el('div', { class: 'facets' }, [
+        chip('All', 'all', facetTotal),
+        ...res.byType.map((b) => chip(b.key, b.key, b.count)),
+      ]));
+    }
+
+    if (res.total === 0) {
+      box.append(el('div', { class: 'muted search-hint' }, [
+        'No objects contain “' + res.query + '”'
+        + (st.typeFilter !== 'all' ? ' in ' + st.typeFilter : '') + '.',
+      ]));
+      return;
+    }
+
+    box.append(el('div', { class: 'muted search-status', role: 'status' }, [
+      fmt(res.total) + ' object' + (res.total === 1 ? '' : 's') + ' match “' + res.query + '”'
+      + (st.typeFilter !== 'all' ? ' in ' + st.typeFilter : '')
+      + (res.truncated ? ' — showing the top ' + fmt(res.results.length) : ''),
+    ]));
+
+    const PAGE = 20;
+    const pages = Math.max(1, Math.ceil(res.results.length / PAGE));
+    if (st.page >= pages) st.page = pages - 1;
+    const pageResults = res.results.slice(st.page * PAGE, st.page * PAGE + PAGE);
+
+    for (const r of pageResults) {
+      const n = r.node;
+      const usedBy = ds.graph.incomingOf(n.uuid).map((e) => e.from);
+      const references = ds.graph.outgoingOf(n.uuid)
+        .filter((e) => e.to !== null && e.field !== 'tenant_ref' && e.field !== 'cloud_ref')
+        .map((e) => e.to);
+      box.append(el('div', { class: 'card result' }, [
+        el('div', { class: 'result-title' }, [
+          el('span', {
+            class: 'edge-target', role: 'link', tabindex: '0',
+            onclick: () => openObject(n.uuid),
+            onkeydown: (e) => { if (e.key === 'Enter') openObject(n.uuid); },
+          }, [n.name ?? n.uuid]),
+          el('span', { class: 'result-type mono' }, [n.type]),
+          n.tenant ? el('span', { class: 'muted' }, ['tenant ' + n.tenant]) : '',
+          n.cloud ? el('span', { class: 'muted' }, ['cloud ' + n.cloud]) : '',
+        ]),
+        ...r.snippets.map((s) => el('div', { class: 'snippet mono' }, [
+          s.field ? el('span', { class: 'edge-field' }, [s.field + ': ']) : '',
+          s.before,
+          el('mark', { class: 'hl' }, [s.match]),
+          s.after,
+        ])),
+        r.count > r.snippets.length ? el('div', { class: 'faint' }, [fmt(r.count) + ' matches in this object']) : '',
+        r.count === 0 ? el('div', { class: 'faint' }, ['Matches the object type name.']) : '',
+        assocLine('Used by', usedBy),
+        assocLine('References', references),
+      ]));
+    }
+
+    if (pages > 1) {
+      box.append(el('div', { class: 'pager', style: 'max-width:860px; margin:0 auto' }, [
+        el('button', { class: 'btn', disabled: st.page === 0 ? '' : null, onclick: () => { st.page--; renderSearchResults(box); } }, ['‹ Prev']),
+        el('span', {}, ['Page ' + (st.page + 1) + ' / ' + pages]),
+        el('button', { class: 'btn', disabled: st.page + 1 >= pages ? '' : null, onclick: () => { st.page++; renderSearchResults(box); } }, ['Next ›']),
+      ]));
+    }
   }
 
   // ---- relationships ----
